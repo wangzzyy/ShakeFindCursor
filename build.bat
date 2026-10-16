@@ -18,7 +18,12 @@ if not exist "%VCVARS%" (
     echo         workload, or edit "VCVARS" in build.bat to point at your MSVC install.
     exit /b 1
 )
-
+rem ★ 关键：真正加载 MSVC 环境（cl/rc/link 等才会进入 PATH）
+call "%VCVARS%"
+if errorlevel 1 (
+    echo [FAIL] Failed to initialize MSVC environment.
+    exit /b 1
+)
 rem vcvars may have changed the working directory; come back to the script dir.
 cd /d "%SRC%"
 
@@ -34,7 +39,9 @@ if errorlevel 1 (
 )
 
 echo Building ShakeFindCursor...
+
 rem 实测 SetSystemCursor 不需要管理员权限，故使用 asInvoker —— 启动不再弹 UAC。
+
 rem 若在个别机器上发现放大失效（光标方案由组策略统管等），可把下面这行改成
 rem   /MANIFESTUAC:"level='requireAdministrator' uiAccess='false'"
 cl /nologo /EHsc /O2 /utf-8 /DUNICODE /D_UNICODE "%SRC%main.cpp" "%SRC%app.res" ^

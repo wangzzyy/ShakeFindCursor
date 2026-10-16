@@ -4,7 +4,35 @@
 // 放大图形用 GDI+ 抗锯齿矢量绘制（不是位图缩放，所以不模糊），
 // 经 CreateIconIndirect 生成 HCURSOR 后 SetSystemCursor 全局替换。
 // 不需要管理员权限。
-//
+// ---------------------------------------------------------------------------
+// v4.9 放大后按固定周期采样速度，低于 kSlowSpeed 即触发缩小动画
+// ---------------------------------------------------------------------------
+// 需求：放大状态下，每 16ms（kPollMs）获取一次当前鼠标速度；速度低于
+//       kSlowSpeed 就触发缩小动画，而不是沿用“速度回落到平缓阈值并持续
+//       一段时间”的旧判定。
+// 实现：
+//   · Tick() 的放大分支不再用 moving 布尔量，而是每个采样周期显式算一次
+//     curSpeed = WindowStats(kCalmWindowSec).speed；curSpeed >= kSlowSpeed
+//     则续命（并打断正在进行的回缩），低于则走原有的 kCalmDelayMs /
+//     kMinHoldMs 防抖后启动回缩动画。
+//   · kCalmDelayMs 默认仍为 180ms，避免晃动到极值点（瞬时速度接近 0）时
+//     误触发回缩；想“一慢就缩”可把它改成 0。
+// 性能：与原版持平，且未放大时略优 ——
+//   · 放大期间：每 16ms 一次 WindowStats(kCalmWindowSec)，与原版完全相同。
+//   · 未放大期间：原版只要鼠标动了就会算一次 WindowStats 来判定 moving；
+//     现在这段计算被移到放大分支之后，未放大时直接跳过，少一次运动学统计。
+//   · 无新增线程 / 定时器 / GDI 对象 / DIB / 窗口，内存与句柄数不变。
+// ---------------------------------------------------------------------------
+// v4.8 放大期间接管全部常见系统光标
+// ---------------------------------------------------------------------------
+// 现象：光标悬在文本框/链接/窗口边框上时（系统光标是 OCR_IBEAM / OCR_HAND /
+//       OCR_SIZEWE 等），晃动鼠标看不到箭头放大 —— 因为上一版只 SetSystemCursor
+//       替换了 OCR_NORMAL，被我们替换的那枚箭头此刻根本没被系统画出来。
+// 对策：放大期间把 OCR_NORMAL / IBEAM / HAND / CROSS / UP / SIZEWE / SIZENS /
+//       SIZENWSE / SIZENESW / SIZEALL 这些常见光标【全部】换成同一枚放大箭头。
+//       每个 ID 喂一枚独立的 HCURSOR（SetSystemCursor 成功后会销毁句柄，不能复用）；
+//       缩回时照旧靠 SPI_SETCURSORS 一次性还原全部，无需逐 ID 追踪。
+// ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // v4.7 跑马灯重做为「Siri 风格 RGB 环绕流光」
 // ---------------------------------------------------------------------------
@@ -132,63 +160,64 @@ namespace Config {
     // ---------------- 采样 ----------------
     // 16ms 与系统默认时钟节拍(~15.6ms)基本对齐，既够用又不会额外增加唤醒次数。
     // 不再依赖 timeBeginPeriod —— 那样会把全系统时钟分辨率抬到 1ms，很费电。
-    const int      kPollMs         = 16;     // 位移采样间隔(ms)
-    const int      kHistoryMs      = 760;    // 轨迹保留时长(ms)，需 >= 最长的判定窗口
-    const size_t   kHistoryMax     = 200;    // 轨迹采样上限（防极端情况下膨胀）
+    const int      kPollMs = 16;     // 位移采样间隔(ms)
+    const int      kHistoryMs = 760;    // 轨迹保留时长(ms)，需 >= 最长的判定窗口
+    const size_t   kHistoryMax = 200;    // 轨迹采样上限（防极端情况下膨胀）
 
     // ---------------- 触发通道 A：快速直线滑动 ----------------
     // macOS 没有这个机制（它只认来回摆动）。打开后"快速甩一下鼠标"就会放大，
     // 日常用鼠标几乎必然误触发，所以默认关闭。真要开，阈值也调得很苛刻：
-    const bool     kEnableSwipe    = false;  // ← 想恢复"快速滑动也放大"就改成 true
+    const bool     kEnableSwipe = false;  // ← 想恢复"快速滑动也放大"就改成 true
     const double   kSwipeWindowSec = 0.14;   // 判定窗口(秒)
-    const double   kSwipeSpeed     = 1800.0; // 净位移速度阈值(px/s)，比旧版 1150 高得多
-    const double   kSwipeMinPx     = 160.0;  // 窗口内最小净位移(px)
-    const double   kSwipeStraight  = 0.85;   // 直线度 = 净位移 / 路径长度，1.0 为绝对笔直
+    const double   kSwipeSpeed = 1800.0; // 净位移速度阈值(px/s)，比旧版 1150 高得多
+    const double   kSwipeMinPx = 160.0;  // 窗口内最小净位移(px)
+    const double   kSwipeStraight = 0.85;   // 直线度 = 净位移 / 路径长度，1.0 为绝对笔直
 
     // ---------------- 触发通道 B：快速晃动（对齐 macOS 手感）----------------
-    const double   kShakeWindowSec = 0.55;   // 数"有效摆动次数"的时间窗(秒)
-    const double   kShakeMinAmpPx  = 24.0;   // 一次摆动至少要反向回撤这么多像素才算数
-    const int      kShakeReversals = 3;      // 窗口内至少几次有效摆动（≈ 来回晃两下）
-    const double   kShakeSpeedSec  = 0.30;   // 看"当前速度"的时间窗(秒)
-    const double   kShakeSpeed     = 550.0;  // 速度下限(px/s)，够快才算"晃"
-    const double   kShakeMaxNetRatio = 0.45; // 净位移/路程 上限：必须是"来回摆"，不是长距离拖动
+    const double   kShakeWindowSec = 0.75;   // 数"有效摆动次数"的时间窗(秒)
+    const double   kShakeMinAmpPx = 25.0;   // 一次摆动至少要反向回撤这么多像素才算数
+    const int      kShakeReversals = 5;      // 窗口内至少几次有效摆动（≈ 来回晃两下）
+    const double   kShakeSpeedSec = 0.50;   // 看"当前速度"的时间窗(秒)
+    const double   kShakeSpeed = 500.0;  // 速度下限(px/s)，够快才算"晃"
+    const double   kShakeMaxNetRatio = 0.5; // 净位移/路程 上限：必须是"来回摆"，不是长距离拖动  
 
     // ---------------- 恢复（平缓判定） ----------------
-    const double   kCalmWindowSec  = 0.22;   // 测"当前速度"用的窗口(秒)，取长一点以免摆动转折点误判为停下
-    const double   kCalmSpeed      = 150.0;  // 低于此速度视为"平缓"(px/s)
-    const int      kCalmDelayMs    = 180;    // 持续平缓多久开始回缩(ms)
-    const int      kMinHoldMs      = 300;    // 每次触发后至少放大这么久(ms)，避免闪烁
+    const double   kCalmWindowSec = 0.22;   // 测"当前速度"用的窗口(秒)，取长一点以免摆动转折点误判为停下
+    const double   kCalmSpeed = 150.0;  // 低于此速度视为"平缓"(px/s)
+    const double   kSlowSpeed = 2000.0;  // 当前鼠标速度低于此值(px/s) → 触发缩小动画
+    const int      kCalmDelayMs = 0;    // 持续平缓多久开始回缩(ms)
+    const int      kMinHoldMs = 500;    // 每次触发后至少放大这么久(ms)，避免闪烁
 
     // ---------------- 缩放动画 ----------------
-    const float    kScaleMin       = 0.72f;  // 空闲时的等效尺度：此时箭头视觉大小≈系统原生箭头
-    const float    kScaleMax       = 3.0f;   // 放大倍数（位图边长 = kNativePx * 该值）
-    const int      kNativePx       = 32;     // 系统光标标准边长(px)，运行时会按 SM_CXCURSOR 校正
-    const int      kGrowMs         = 180;    // 放大动画时长(ms)
-    const int      kShrinkMs       = 300;    // 回缩动画时长(ms)
-    const int      kAnimMinFps     = 24;     // 动画帧率下限（刷新率读到异常值时的兜底）
-    const int      kAnimMaxFps     = 240;    // 动画帧率上限（刷新率再高也不超过，省资源）
+    const float    kScaleMin = 0.72f;  // 空闲时的等效尺度：此时箭头视觉大小≈系统原生箭头
+    const float    kScaleMax = 3.0f;   // 放大倍数（位图边长 = kNativePx * 该值）
+    const int      kNativePx = 32;     // 系统光标标准边长(px)，运行时会按 SM_CXCURSOR 校正
+    const int      kGrowMs = 180;    // 放大动画时长(ms)
+    const int      kShrinkMs = 300;    // 回缩动画时长(ms)
+    const int      kAnimMinFps = 24;     // 动画帧率下限（刷新率读到异常值时的兜底）
+    const int      kAnimMaxFps = 240;    // 动画帧率上限（刷新率再高也不超过，省资源）
 
     // ---------------- 多屏跑马灯：Siri 风格 RGB 环绕流光 ----------------
     // 接了两个及以上显示器时，放大期间在【光标所在屏】四边亮起一圈**环绕流动的
     // RGB 彩色光晕**（整圈色相渐变 + 流动亮斑 + 近白"灯丝"亮心），一眼就能确认
     // 指针在哪块屏。单显示器时完全不出现。
-    const bool     kMarqueeEnable    = true; // ← 总开关（托盘菜单也能切）
-    const double   kMarqueeThickRatio= 0.030;// 光带厚度 = min(屏宽,屏高) × 该比例
-    const int      kMarqueeThickMin  = 18;   // 厚度下限(px)
-    const int      kMarqueeThickMax  = 96;   // 厚度上限(px)
-    const int      kMarqueeCorePx    = 3;    // 最亮的"灯丝"核心线宽度(px)
+    const bool     kMarqueeEnable = true; // ← 总开关（托盘菜单也能切）
+    const double   kMarqueeThickRatio = 0.030;// 光带厚度 = min(屏宽,屏高) × 该比例
+    const int      kMarqueeThickMin = 18;   // 厚度下限(px)
+    const int      kMarqueeThickMax = 96;   // 厚度上限(px)
+    const int      kMarqueeCorePx = 3;    // 最亮的"灯丝"核心线宽度(px)
     const double   kMarqueeGlowDecay = 0.28; // 辉光衰减：σ = 厚度 × 该值（越小光带越"紧"）
-    const double   kMarqueeSat       = 0.80; // 颜色饱和度（1.0 最艳；太高会显得廉价）
-    const double   kMarqueeVal       = 1.00; // 颜色明度
+    const double   kMarqueeSat = 0.80; // 颜色饱和度（1.0 最艳；太高会显得廉价）
+    const double   kMarqueeVal = 1.00; // 颜色明度
     const double   kMarqueeCoreWhite = 0.80; // 核心线掺白比例，做出"灯丝"亮心
-    const double   kMarqueeHueSpan   = 1.00; // 用掉多少色环：1.0=整圈彩虹；≈0.42≈蓝→紫→粉→橙
-    const double   kMarqueeHueBase   = 0.52; // 色环起点
-    const double   kMarqueeFlowSec   = 2.6;  // 色相绕屏流一圈的时间(秒)
-    const double   kMarqueeWaveNum   = 3.0;  // 一圈上有几个流动亮斑
-    const double   kMarqueeWaveSec   = 3.1;  // 亮斑流动周期(秒)
-    const double   kMarqueeWaveAmp   = 0.26; // 亮斑明暗起伏幅度 0~1
-    const double   kMarqueeFadeSec   = 0.25; // 淡入 / 淡出时长(秒)
-    const int      kMarqueeFps       = 50;   // 跑马灯帧率（慢速流光，不必跟刷新率）
+    const double   kMarqueeHueSpan = 1.00; // 用掉多少色环：1.0=整圈彩虹；≈0.42≈蓝→紫→粉→橙
+    const double   kMarqueeHueBase = 0.52; // 色环起点
+    const double   kMarqueeFlowSec = 2.6;  // 色相绕屏流一圈的时间(秒)
+    const double   kMarqueeWaveNum = 3.0;  // 一圈上有几个流动亮斑
+    const double   kMarqueeWaveSec = 3.1;  // 亮斑流动周期(秒)
+    const double   kMarqueeWaveAmp = 0.26; // 亮斑明暗起伏幅度 0~1
+    const double   kMarqueeFadeSec = 0.25; // 淡入 / 淡出时长(秒)
+    const int      kMarqueeFps = 50;   // 跑马灯帧率（慢速流光，不必跟刷新率）
 }
 
 // ===========================================================================
@@ -203,8 +232,8 @@ static const float kArrow[7][2] = {
     {0.281f, 0.406f},   // 尾巴右上
     {0.500f, 0.406f},   // 头部右下
 };
-static const float kArrowW   = 0.500f;              // 归一化包围盒宽
-static const float kArrowH   = 0.781f;              // 归一化包围盒高
+static const float kArrowW = 0.500f;              // 归一化包围盒宽
+static const float kArrowH = 0.781f;              // 归一化包围盒高
 static const float kArrowPad = 0.05f;               // 位图内边距（留空间给描边/投影）
 
 // 把归一化坐标映射到 [0,1] 位图坐标所用的缩放系数
@@ -213,9 +242,9 @@ static inline float ArrowScale() { return (1.0f - 2.0f * kArrowPad) / kArrowH; }
 // ===========================================================================
 // 全局状态
 // ===========================================================================
-static HINSTANCE g_hInst    = nullptr;
-static HWND      g_hwnd     = nullptr;
-static bool      g_enabled  = true;
+static HINSTANCE g_hInst = nullptr;
+static HWND      g_hwnd = nullptr;
+static bool      g_enabled = true;
 static bool      g_shutdown = false;
 
 // 轨迹采样
@@ -223,27 +252,27 @@ struct Sample { POINT pt; ULONGLONG when; };
 static std::deque<Sample> g_history;
 
 // 缩放状态机
-static float g_scale       = Config::kScaleMin;  // 当前尺度
-static float g_target      = Config::kScaleMin;  // 目标尺度
-static float g_animFrom    = Config::kScaleMin;  // 本段动画起点
-static float g_animTo      = Config::kScaleMin;  // 本段动画终点
-static bool  g_animActive  = false;              // 是否正在出帧
-static bool  g_enlarged    = false;              // 是否处于"放大"状态
+static float g_scale = Config::kScaleMin;  // 当前尺度
+static float g_target = Config::kScaleMin;  // 目标尺度
+static float g_animFrom = Config::kScaleMin;  // 本段动画起点
+static float g_animTo = Config::kScaleMin;  // 本段动画终点
+static bool  g_animActive = false;              // 是否正在出帧
+static bool  g_enlarged = false;              // 是否处于"放大"状态
 static ULONGLONG g_lastTrigger = 0;               // 最近一次触发时刻
-static ULONGLONG g_lastActive  = 0;               // 最近一次"运动超过平缓阈值"的时刻
-static int   g_nativePx    = Config::kNativePx;  // 运行时校准的原生光标边长
+static ULONGLONG g_lastActive = 0;               // 最近一次"运动超过平缓阈值"的时刻
+static int   g_nativePx = Config::kNativePx;  // 运行时校准的原生光标边长
 static int   g_installedPx = 0;                  // 当前已装进系统的自定义光标边长；0 = 未接管
 
 // 动画时序：QPC 时间基准 + 高精度可等待定时器（不需要 timeBeginPeriod）
-static HANDLE        g_animTimer   = nullptr;
-static LARGE_INTEGER g_qpf         = {};         // QPC 频率
-static double        g_animT0      = 0.0;        // 本段动画起点（QPC 秒）
-static double        g_animDurSec  = 0.0;        // 本段动画时长（秒）
-static double        g_frameSec    = 1.0 / 60.0; // 帧间隔 = 1/刷新率
+static HANDLE        g_animTimer = nullptr;
+static LARGE_INTEGER g_qpf = {};         // QPC 频率
+static double        g_animT0 = 0.0;        // 本段动画起点（QPC 秒）
+static double        g_animDurSec = 0.0;        // 本段动画时长（秒）
+static double        g_frameSec = 1.0 / 60.0; // 帧间隔 = 1/刷新率
 static double        g_nextFrameAt = 0.0;        // 下一帧的 QPC 时刻（绝对栅格，不累积漂移）
 
 // 光标所在显示器的刷新率缓存
-static HMONITOR g_mon       = nullptr;
+static HMONITOR g_mon = nullptr;
 static int      g_refreshHz = 60;
 
 // 静止快速通道：位置没变就跳过整套判定
@@ -258,7 +287,7 @@ static NOTIFYICONDATAW g_nid = {};
 static bool g_trayAdded = false;
 
 static const wchar_t kAppName[] = L"ShakeFindCursor";
-static const wchar_t kRunKey[]  = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+static const wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 
 // ===========================================================================
 // 前置声明
@@ -274,11 +303,11 @@ static std::wstring GetExePath();
 // 轨迹与运动学统计
 // ===========================================================================
 static void RecordMove(POINT pt, ULONGLONG now) {
-    g_history.push_back({pt, now});
+    g_history.push_back({ pt, now });
 
     // 按时间裁剪
     while (!g_history.empty() &&
-           (now - g_history.front().when) > (DWORD)Config::kHistoryMs) {
+        (now - g_history.front().when) > (DWORD)Config::kHistoryMs) {
         g_history.pop_front();
     }
     // 按数量裁剪（双保险）
@@ -289,13 +318,13 @@ static void RecordMove(POINT pt, ULONGLONG now) {
 
 // 一段时间窗内的运动特征
 struct Motion {
-    double path      = 0.0;   // 沿轨迹累计路程(px)
-    double net       = 0.0;   // 首尾净位移(px)
-    double dt        = 0.0;   // 时间跨度(s)
-    double speed     = 0.0;   // path / dt，反映"动得多快"
-    double netSpeed  = 0.0;   // net  / dt，反映"实际挪了多远"
+    double path = 0.0;   // 沿轨迹累计路程(px)
+    double net = 0.0;   // 首尾净位移(px)
+    double dt = 0.0;   // 时间跨度(s)
+    double speed = 0.0;   // path / dt，反映"动得多快"
+    double netSpeed = 0.0;   // net  / dt，反映"实际挪了多远"
     int    reversals = 0;     // 主轴上方向反转次数
-    bool   valid     = false;
+    bool   valid = false;
 };
 
 // 单轴"摆动"计数：只有在极值点反向回撤 >= amp 像素，才记一次有效摆动。
@@ -313,12 +342,14 @@ static int CountOscillations(const double* v, size_t n, double amp) {
         if (dir == 0) {
             if (x > hi) hi = x;
             if (x < lo) lo = x;
-            if (x - lo >= amp)      { dir = +1; extreme = x; }   // 从低点向上拉开 → 定为向上摆
+            if (x - lo >= amp) { dir = +1; extreme = x; }   // 从低点向上拉开 → 定为向上摆
             else if (hi - x >= amp) { dir = -1; extreme = x; }   // 从高点向下拉开 → 定为向下摆
-        } else if (dir > 0) {
+        }
+        else if (dir > 0) {
             if (x > extreme) extreme = x;
             else if (extreme - x >= amp) { ++reversals; dir = -1; extreme = x; }  // 到顶后回撤够多
-        } else {
+        }
+        else {
             if (x < extreme) extreme = x;
             else if (x - extreme >= amp) { ++reversals; dir = +1; extreme = x; }  // 到底后回升够多
         }
@@ -340,8 +371,8 @@ static Motion WindowStats(double winSec) {
     if (n - i0 < 3) return m;
 
     // 路程 + 两轴投影（投影用于后面的摆动分析）
-    double xs[Config::kHistoryMax];
-    double ys[Config::kHistoryMax];
+    double xs[Config::kHistoryMax]{};
+    double ys[Config::kHistoryMax]{};
     size_t cnt = 0;
     POINT prev = g_history[i0].pt;
     xs[cnt] = (double)prev.x;
@@ -366,14 +397,14 @@ static Motion WindowStats(double winSec) {
     const POINT& a = g_history[i0].pt;
     const POINT& b = g_history[n - 1].pt;
     m.net = std::sqrt((double)(b.x - a.x) * (double)(b.x - a.x) +
-                      (double)(b.y - a.y) * (double)(b.y - a.y));
+        (double)(b.y - a.y) * (double)(b.y - a.y));
 
     m.dt = (double)(now - g_history[i0].when) / 1000.0;
     if (m.dt <= 0.0) return m;
 
-    m.speed    = m.path / m.dt;
-    m.netSpeed = m.net  / m.dt;
-    m.valid    = true;
+    m.speed = m.path / m.dt;
+    m.netSpeed = m.net / m.dt;
+    m.valid = true;
     return m;
 }
 
@@ -467,7 +498,7 @@ static std::vector<CursorBits> g_bitsCache;
 // 渲染一张指定边长的箭头位图（颜色 DIB + 单色掩码）
 static bool RenderPointerBits(int side, HBITMAP& outColor, HBITMAP& outMask) {
     outColor = nullptr;
-    outMask  = nullptr;
+    outMask = nullptr;
     if (side < 16) side = 16;
 
     // 复用常驻内存 DC（每次建/还 DC 是白开销）；万一还没建好就临时取一个
@@ -477,20 +508,20 @@ static bool RenderPointerBits(int side, HBITMAP& outColor, HBITMAP& outMask) {
 
     // 32bpp 顶向下 DIB，带 alpha —— 可直接当作 CreateIconIndirect 的颜色位图
     BITMAPV5HEADER bi = {};
-    bi.bV5Size        = sizeof(BITMAPV5HEADER);
-    bi.bV5Width       = side;
-    bi.bV5Height      = -side;              // 负高度 = 顶向下，与 GDI+ 扫描行方向一致
-    bi.bV5Planes      = 1;
-    bi.bV5BitCount    = 32;
+    bi.bV5Size = sizeof(BITMAPV5HEADER);
+    bi.bV5Width = side;
+    bi.bV5Height = -side;              // 负高度 = 顶向下，与 GDI+ 扫描行方向一致
+    bi.bV5Planes = 1;
+    bi.bV5BitCount = 32;
     bi.bV5Compression = BI_BITFIELDS;
-    bi.bV5RedMask     = 0x00FF0000;
-    bi.bV5GreenMask   = 0x0000FF00;
-    bi.bV5BlueMask    = 0x000000FF;
-    bi.bV5AlphaMask   = 0xFF000000;
+    bi.bV5RedMask = 0x00FF0000;
+    bi.bV5GreenMask = 0x0000FF00;
+    bi.bV5BlueMask = 0x000000FF;
+    bi.bV5AlphaMask = 0xFF000000;
 
     void* bits = nullptr;
     HBITMAP color = ::CreateDIBSection(hdc, (BITMAPINFO*)&bi, DIB_RGB_COLORS,
-                                       &bits, nullptr, 0);
+        &bits, nullptr, 0);
     if (!color || !bits) {
         if (color) ::DeleteObject(color);
         if (ownDC) ::ReleaseDC(nullptr, hdc);
@@ -500,7 +531,7 @@ static bool RenderPointerBits(int side, HBITMAP& outColor, HBITMAP& outMask) {
     // GDI+ 直接画进这段 DIB 内存（在 color 失效前完成）
     {
         Gdiplus::Bitmap bmp(side, side, side * 4, PixelFormat32bppARGB,
-                            (BYTE*)bits);
+            (BYTE*)bits);
         if (bmp.GetLastStatus() == Gdiplus::Ok)
             DrawPointerBitmap(bmp, side);
     }
@@ -530,7 +561,7 @@ static bool RenderPointerBits(int side, HBITMAP& outColor, HBITMAP& outMask) {
 
     if (ownDC) ::ReleaseDC(nullptr, hdc);
     outColor = color;
-    outMask  = mask;
+    outMask = mask;
     return true;
 }
 
@@ -562,39 +593,58 @@ static HCURSOR MakePointerCursor(int side) {
     const CursorBits* b = GetCursorBits(side);
     if (!b) return nullptr;
     const HBITMAP color = b->color;      // 先拷出来，避免 vector 扩容后指针悬垂
-    const HBITMAP mask  = b->mask;
+    const HBITMAP mask = b->mask;
 
     // 热点 = 箭头尖端在位图中的位置，保证点击位置不漂移
     const int hot = (int)(kArrowPad * side + 0.5f);
 
     ICONINFO ii = {};
-    ii.fIcon     = FALSE;
-    ii.xHotspot  = (DWORD)hot;
-    ii.yHotspot  = (DWORD)hot;
-    ii.hbmColor  = color;
-    ii.hbmMask   = mask;
+    ii.fIcon = FALSE;
+    ii.xHotspot = (DWORD)hot;
+    ii.yHotspot = (DWORD)hot;
+    ii.hbmColor = color;
+    ii.hbmMask = mask;
     return ::CreateIconIndirect(&ii);    // 内部会复制位图
 }
 
-// ===========================================================================
-// 光标安装 / 恢复
-// ===========================================================================
+// ---------------------------------------------------------------------------
+// 放大期间一并接管的系统光标。
+// 光标形状随悬停对象变化：文本上是 I 型、链接上是小手、窗口边上是双向箭头……
+// 只换 OCR_NORMAL 的话，用户此刻看到的就是那些没被换掉的光标，"放大"不可见。
+// 所以把这些常见 ID 全部换成同一枚放大箭头；缩回时由 SPI_SETCURSORS 统一还原。
+// ---------------------------------------------------------------------------
+static const DWORD kArrowCursorIds[] = {
+    OCR_NORMAL,     // 普通箭头
+    OCR_IBEAM,      // 文本 I 型
+    OCR_HAND,       // 链接小手
+    OCR_CROSS,      // 十字准星
+    OCR_UP,         // 向上箭头
+    OCR_SIZEWE,     // 左右双向（列宽）
+    OCR_SIZENS,     // 上下双向（行高）
+    OCR_SIZENWSE,   // 左上-右下（窗口角）
+    OCR_SIZENESW,   // 右上-左下（窗口角）
+    OCR_SIZEALL,    // 移动十字
+    OCR_WAIT,       // 忙碌沙漏
+    OCR_APPSTARTING,// 后台启动
+};
+
 // 把系统箭头替换成指定尺度下的自定义光标。
-// 注意：SetSystemCursor 成功后会用 DestroyCursor 销毁我们传入的句柄（MSDN），
-//       所以每次都必须新建，绝不能缓存复用；失败时我们自己释放以免泄漏。
+// 注意：SetSystemCursor 成功后会用 DestroyCursor 销毁传入的句柄（MSDN），
+//       所以每个光标 ID 都必须【各自新建】一枚句柄，绝不能复用；
+//       失败时我们自己释放以免泄漏。
 static void ApplyScale(float scale) {
     int px = (int)((float)g_nativePx * scale + 0.5f);   // 按系统实际光标尺寸换算
     if (px < 16) px = 16;
     if (px == g_installedPx) return;     // 尺寸没变，不必重装
 
-    HCURSOR cur = MakePointerCursor(px);
-    if (!cur) return;
-
-    if (::SetSystemCursor(cur, OCR_NORMAL)) {
-        g_installedPx = px;              // 系统已接管并销毁 cur
-    } else {
-        ::DestroyCursor(cur);            // 失败：自己回收
+    bool any = false;
+    for (DWORD id : kArrowCursorIds) {
+        HCURSOR cur = MakePointerCursor(px);     // 每次都新建（内部位图仍走缓存）
+        if (!cur) continue;
+        if (::SetSystemCursor(cur, id)) any = true;   // 系统接管并销毁 cur
+        else ::DestroyCursor(cur);                    // 失败：自己回收
     }
+    if (any) g_installedPx = px;
 }
 
 // 无条件交还系统原生光标（可重复调用，幂等）
@@ -646,7 +696,7 @@ static bool EnsureRefreshRate(POINT pt) {
     int hz = QueryRefreshHz(mon);
     if (hz < Config::kAnimMinFps || hz > Config::kAnimMaxFps) hz = 60;
     g_refreshHz = hz;
-    g_frameSec  = 1.0 / (double)hz;
+    g_frameSec = 1.0 / (double)hz;
     return true;
 }
 
@@ -680,11 +730,11 @@ static void StopAnim() {
 // 启动 / 重启一段动画。缩放中途被打断（抖动续命、回缩中再次触发）也能平滑接上：
 // from 传当前实际尺度，于是不会有跳变。
 static void StartAnim(float from, float to, double durSec) {
-    g_animActive  = true;
-    g_animFrom    = from;
-    g_animTo      = to;
-    g_animDurSec  = (durSec > 0.0) ? durSec : 0.001;
-    g_animT0      = QpcNow();
+    g_animActive = true;
+    g_animFrom = from;
+    g_animTo = to;
+    g_animDurSec = (durSec > 0.0) ? durSec : 0.001;
+    g_animT0 = QpcNow();
     g_nextFrameAt = g_animT0;
     AnimStep();                                   // 立刻画第一帧，避免拖到下一格
 }
@@ -704,11 +754,12 @@ static void AnimStep() {
     // 回缩收尾：不再多画一帧自定义小箭头，直接把系统光标交还回去，
     // 避免"自定义箭头 → 系统箭头"的形态跳变。
     if (u >= 1.0 && g_animTo <= Config::kScaleMin + 1e-3f) {
-        g_scale    = Config::kScaleMin;
-        g_target   = Config::kScaleMin;
+        g_scale = Config::kScaleMin;
+        g_target = Config::kScaleMin;
         g_enlarged = false;
         StopAnim();
         RestoreSystemCursor();
+        FreeCursorBits();
         return;
     }
 
@@ -723,430 +774,431 @@ static void AnimStep() {
 // ===========================================================================
 namespace Marquee {
 
-const int kStrips = 4;
-const wchar_t kClass[] = L"ShakeFindCursorMarquee";
+    const int kStrips = 4;
+    const wchar_t kClass[] = L"ShakeFindCursorMarquee";
 
-struct Strip {
-    HWND           hwnd     = nullptr;
-    int            x = 0, y = 0, w = 0, h = 0;  // 屏幕坐标 + 位图尺寸
-    bool           alongIsX = true;             // 沿边轴：true=x(上下边)，false=y(左右边)
-    // 垂直剖面在缓冲区里的方向。DIB 是【顶向下】存储：
-    //   上边条 缓冲第 0 行 = 屏幕顶边 = 外沿 → 不翻转
-    //   左边条 缓冲第 0 列 = 屏幕左边 = 外沿 → 不翻转
-    //   下边条 缓冲第 0 行 = 内沿（屏幕底边才是最后一行）→ 要翻转
-    //   右边条 缓冲第 0 列 = 内沿 → 要翻转
-    bool           perpFlip = false;
-    int            thick    = 0;
-    int            alongLen = 0;
-    double         sAt0     = 0.0;              // 沿边索引 0 处的弧长
-    double         sStep    = 1.0;              // 每步弧长增量（+1 / -1）
-    HDC            memDC    = nullptr;
-    HBITMAP        dib      = nullptr;
-    HGDIOBJ        oldBmp   = nullptr;
-    unsigned char* px       = nullptr;          // BGRA，已预乘
-};
+    struct Strip {
+        HWND           hwnd = nullptr;
+        int            x = 0, y = 0, w = 0, h = 0;  // 屏幕坐标 + 位图尺寸
+        bool           alongIsX = true;             // 沿边轴：true=x(上下边)，false=y(左右边)
+        // 垂直剖面在缓冲区里的方向。DIB 是【顶向下】存储：
+        //   上边条 缓冲第 0 行 = 屏幕顶边 = 外沿 → 不翻转
+        //   左边条 缓冲第 0 列 = 屏幕左边 = 外沿 → 不翻转
+        //   下边条 缓冲第 0 行 = 内沿（屏幕底边才是最后一行）→ 要翻转
+        //   右边条 缓冲第 0 列 = 内沿 → 要翻转
+        bool           perpFlip = false;
+        int            thick = 0;
+        int            alongLen = 0;
+        double         sAt0 = 0.0;              // 沿边索引 0 处的弧长
+        double         sStep = 1.0;              // 每步弧长增量（+1 / -1）
+        HDC            memDC = nullptr;
+        HBITMAP        dib = nullptr;
+        HGDIOBJ        oldBmp = nullptr;
+        unsigned char* px = nullptr;          // BGRA，已预乘
+    };
 
-static Strip g_strip[kStrips];
+    static Strip g_strip[kStrips];
 
-// 色环查表：1024 档 hue -> RGB，避免每列都做一次 HSV 换算
-static unsigned char g_hueLut[1024 * 3] = {};
-// 垂直方向的衰减与"掺白"档位（长度 = 光带厚度）
-static std::vector<unsigned char> g_prof;      // 辉光强度 0..255
-static std::vector<unsigned char> g_whiteMix;  // 掺白比例 0..255（做出灯丝亮心）
-static bool g_tablesReady = false;
+    // 色环查表：1024 档 hue -> RGB，避免每列都做一次 HSV 换算
+    static unsigned char g_hueLut[1024 * 3] = {};
+    // 垂直方向的衰减与"掺白"档位（长度 = 光带厚度）
+    static std::vector<unsigned char> g_prof;      // 辉光强度 0..255
+    static std::vector<unsigned char> g_whiteMix;  // 掺白比例 0..255（做出灯丝亮心）
+    static bool g_tablesReady = false;
 
-static bool   g_built      = false;
-static bool   g_on         = false;           // 期望显示（淡出期间仍为 false）
-static float  g_alpha      = 0.0f;            // 当前淡入淡出系数
-static double g_phase      = 0.0;             // 色相流动相位 0..1
-static double g_wavePhase  = 0.0;             // 亮斑流动相位 0..1
-static double g_perimeter  = 1.0;
-static double g_lastAt     = 0.0;
-static HMONITOR g_builtFor = nullptr;         // 已按哪块屏布好局
-static int    g_monCount   = 1;               // 显示器数量（>=2 才启用）
-static bool   g_userOn     = Config::kMarqueeEnable;   // 托盘菜单可切的总开关
+    static bool   g_built = false;
+    static bool   g_on = false;           // 期望显示（淡出期间仍为 false）
+    static float  g_alpha = 0.0f;            // 当前淡入淡出系数
+    static double g_phase = 0.0;             // 色相流动相位 0..1
+    static double g_wavePhase = 0.0;             // 亮斑流动相位 0..1
+    static double g_perimeter = 1.0;
+    static double g_lastAt = 0.0;
+    static HMONITOR g_builtFor = nullptr;         // 已按哪块屏布好局
+    static int    g_monCount = 1;               // 显示器数量（>=2 才启用）
+    static bool   g_userOn = Config::kMarqueeEnable;   // 托盘菜单可切的总开关
 
-static const double kPi = 3.14159265358979323846;
+    static const double kPi = 3.14159265358979323846;
 
-// ---- 色环查表：H(0..1) → RGB ----
-static void BuildHueLut() {
-    const double S = Config::kMarqueeSat;
-    const double V = Config::kMarqueeVal;
-    for (int i = 0; i < 1024; ++i) {
-        const double h  = (double)i / 1024.0;
-        const double hp = h * 6.0;
-        const int    sext = (int)hp;
-        const double f = hp - sext;
-        const double p = V * (1.0 - S);
-        const double q = V * (1.0 - S * f);
-        const double t = V * (1.0 - S * (1.0 - f));
-        double r, g, b;
-        switch (sext % 6) {
+    // ---- 色环查表：H(0..1) → RGB ----
+    static void BuildHueLut() {
+        const double S = Config::kMarqueeSat;
+        const double V = Config::kMarqueeVal;
+        for (int i = 0; i < 1024; ++i) {
+            const double h = (double)i / 1024.0;
+            const double hp = h * 6.0;
+            const int    sext = (int)hp;
+            const double f = hp - sext;
+            const double p = V * (1.0 - S);
+            const double q = V * (1.0 - S * f);
+            const double t = V * (1.0 - S * (1.0 - f));
+            double r, g, b;
+            switch (sext % 6) {
             case 0:  r = V; g = t; b = p; break;
             case 1:  r = q; g = V; b = p; break;
             case 2:  r = p; g = V; b = t; break;
             case 3:  r = p; g = q; b = V; break;
             case 4:  r = t; g = p; b = V; break;
             default: r = V; g = p; b = q; break;
-        }
-        g_hueLut[i * 3 + 0] = (unsigned char)(r * 255.0 + 0.5);
-        g_hueLut[i * 3 + 1] = (unsigned char)(g * 255.0 + 0.5);
-        g_hueLut[i * 3 + 2] = (unsigned char)(b * 255.0 + 0.5);
-    }
-}
-
-// ---- 垂直剖面：核心几行满强度 + 指数辉光衰减 + 核心掺白 ----
-static void BuildProfile(int thick) {
-    if (thick < 4) thick = 4;
-    g_prof.assign(thick, 0);
-    g_whiteMix.assign(thick, 0);
-
-    const int    core  = (Config::kMarqueeCorePx < thick) ? Config::kMarqueeCorePx : 1;
-    const double sigma = (double)thick * Config::kMarqueeGlowDecay;
-    const double sg    = (sigma > 1.0) ? sigma : 1.0;
-
-    for (int j = 0; j < thick; ++j) {
-        double a = 1.0;
-        if (j >= core) {
-            a = std::exp(-(double)(j - core) / sg);
-            if (a < 0.004) a = 0.0;          // 尾部直接归零，渲染时可以提前 break
-        }
-        g_prof[j] = (unsigned char)(a * 255.0 + 0.5);
-
-        // 核心线掺白：前几行二次衰减，做出"灯丝"亮心
-        double wm = 0.0;
-        const int whiteRows = core + 4;
-        if (j < whiteRows) {
-            const double t = 1.0 - (double)j / (double)whiteRows;
-            wm = t * t * Config::kMarqueeCoreWhite;
-        }
-        g_whiteMix[j] = (unsigned char)(wm * 255.0 + 0.5);
-    }
-}
-
-static void BuildTables(int thick) {
-    if (!g_tablesReady) { BuildHueLut(); g_tablesReady = true; }
-    BuildProfile(thick);
-}
-
-static bool EnsureClass() {
-    static int state = 0;                 // 0=未尝试 1=成功 2=失败
-    if (state == 1) return true;
-    if (state == 2) return false;
-
-    WNDCLASSEXW wc = {};
-    wc.cbSize        = sizeof(wc);
-    wc.lpfnWndProc   = ::DefWindowProcW;   // 纯画布，不需要处理任何消息
-    wc.hInstance     = g_hInst;
-    wc.lpszClassName = kClass;
-    if (::RegisterClassExW(&wc)) { state = 1; return true; }
-    if (::GetLastError() == ERROR_CLASS_ALREADY_EXISTS) { state = 1; return true; }
-    state = 2;
-    return false;
-}
-
-static void ReleaseStrip(Strip& st) {
-    if (st.memDC) {
-        if (st.oldBmp) ::SelectObject(st.memDC, st.oldBmp);
-        ::DeleteDC(st.memDC);
-        st.memDC = nullptr; st.oldBmp = nullptr;
-    }
-    if (st.dib) { ::DeleteObject(st.dib); st.dib = nullptr; }
-    if (st.hwnd) { ::DestroyWindow(st.hwnd); st.hwnd = nullptr; }
-    st.px = nullptr;
-}
-
-static bool CreateStrip(Strip& st) {
-    ReleaseStrip(st);
-    if (st.w <= 0 || st.h <= 0) return false;
-
-    st.hwnd = ::CreateWindowExW(
-        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST |
-            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-        kClass, L"", WS_POPUP, st.x, st.y, st.w, st.h,
-        nullptr, nullptr, g_hInst, nullptr);
-    if (!st.hwnd) return false;
-
-    st.memDC = ::CreateCompatibleDC(nullptr);
-    if (!st.memDC) return false;
-
-    BITMAPV5HEADER bi = {};
-    bi.bV5Size        = sizeof(bi);
-    bi.bV5Width       = st.w;
-    bi.bV5Height      = -st.h;
-    bi.bV5Planes      = 1;
-    bi.bV5BitCount    = 32;
-    bi.bV5Compression = BI_BITFIELDS;
-    bi.bV5RedMask     = 0x00FF0000;
-    bi.bV5GreenMask   = 0x0000FF00;
-    bi.bV5BlueMask    = 0x000000FF;
-    bi.bV5AlphaMask   = 0xFF000000;
-
-    void* bits = nullptr;
-    st.dib = ::CreateDIBSection(st.memDC, (BITMAPINFO*)&bi, DIB_RGB_COLORS,
-                                &bits, nullptr, 0);
-    if (!st.dib || !bits) return false;
-
-    st.px = (unsigned char*)bits;
-    st.oldBmp = ::SelectObject(st.memDC, st.dib);
-    ::memset(st.px, 0, (size_t)st.w * (size_t)st.h * 4);
-    return true;
-}
-
-// 按目标显示器铺四块边条。
-//
-// 四角的"羽化"是这么做的：四条边条都【贯通整条边】—— 左右两条贯穿整屏高度、
-// 上下两条贯穿整屏宽度，于是每个角落的 T×T 方块由相邻两条边条【重叠】渲染。
-// 分层窗口的 over 合成天然近似"取并集"：1-(1-a)(1-b) ≥ max(a,b)，
-// 水平辉光与垂直辉光在角落互相补齐 —— 正是一根弯过角落的霓虹管该有的样子。
-// 旧版让左右两条"让开四角"，结果是垂直光带在 y=top+T 处以满强度突然出现
-// （水平辉光在那里已衰减到 ~3%），沿边缘出现 3%→100% 的生硬断口 —— 已废弃。
-//
-// 弧长参数按真实周长精确衔接（像素步进数 L = 2(W-1)+2(H-1)）：
-//   上 0..W-1 → 右 W-1..W+H-2 → 下 W+H-2..2W+H-3 → 左 2W+H-3..2W+2H-4
-// 四个角点处两条边的 s 完全相等，hue 与亮斑相位过角零跳变。
-static void Layout(HMONITOR mon) {
-    MONITORINFO mi = {};
-    mi.cbSize = sizeof(mi);
-    if (!::GetMonitorInfoW(mon, &mi)) return;
-
-    const RECT r = mi.rcMonitor;
-    const int  W = r.right - r.left;
-    const int  H = r.bottom - r.top;
-
-    // 光带厚度按屏幕短边取比例，保证不同尺寸屏幕上观感一致
-    int T = (int)((W < H ? W : H) * Config::kMarqueeThickRatio + 0.5);
-    if (T < Config::kMarqueeThickMin) T = Config::kMarqueeThickMin;
-    if (T > Config::kMarqueeThickMax) T = Config::kMarqueeThickMax;
-    const int lim = ((W < H ? W : H) / 4);
-    if (T > lim) T = lim;
-    if (T < 4)   T = 4;
-
-    if (W < 2 * T + 8 || H < 2 * T + 8) return;   // 屏太小，角落会吞掉整条边，算了
-
-    BuildTables(T);
-
-    g_perimeter = 2.0 * (W + H) - 4.0;            // 色相/亮斑归一化的真实周长
-
-    // 上边：x = 0..W-1 → s = 0..W-1（右上角 s=W-1 与右边条起点精确相等）
-    Strip& top = g_strip[0];
-    top.x = r.left; top.y = r.top; top.w = W; top.h = T;
-    top.alongIsX = true; top.perpFlip = false;
-    top.thick = T; top.alongLen = W;
-    top.sAt0 = 0.0; top.sStep = 1.0;
-
-    // 右边：贯通整屏高度。y = 0..H-1 → s = W-1..W+H-2
-    Strip& right = g_strip[1];
-    right.x = r.right - T; right.y = r.top;
-    right.w = T; right.h = H;
-    right.alongIsX = false; right.perpFlip = true;
-    right.thick = T; right.alongLen = H;
-    right.sAt0 = (double)(W - 1); right.sStep = 1.0;
-
-    // 下边：x = 0..W-1 → s = 2W+H-3 .. W+H-2（右下角与左边条起点精确相等）
-    Strip& bottom = g_strip[2];
-    bottom.x = r.left; bottom.y = r.bottom - T; bottom.w = W; bottom.h = T;
-    bottom.alongIsX = true; bottom.perpFlip = true;
-    bottom.thick = T; bottom.alongLen = W;
-    bottom.sAt0 = (double)(2 * W + H - 3); bottom.sStep = -1.0;
-
-    // 左边：贯通整屏高度。y = 0..H-1 → s = 2W+2H-4 .. 2W+H-3
-    // （顶端 s=2W+2H-4=L 回绕到上边起点的 s=0，闭环成立）
-    Strip& left = g_strip[3];
-    left.x = r.left; left.y = r.top;
-    left.w = T; left.h = H;
-    left.alongIsX = false; left.perpFlip = false;
-    left.thick = T; left.alongLen = H;
-    left.sAt0 = (double)(2 * W + 2 * H - 4); left.sStep = -1.0;
-
-    g_built = true;
-    for (int i = 0; i < kStrips; ++i) CreateStrip(g_strip[i]);
-}
-
-static void Destroy() {
-    for (int i = 0; i < kStrips; ++i) ReleaseStrip(g_strip[i]);
-    g_built = false;
-    g_alpha = 0.0f;
-    g_on    = false;
-}
-
-static void HideNow() {
-    g_on    = false;
-    g_alpha = 0.0f;
-    for (int i = 0; i < kStrips; ++i)
-        if (g_strip[i].hwnd) ::ShowWindow(g_strip[i].hwnd, SW_HIDE);
-}
-
-// 沿边逐列：算出该列的颜色（色相环绕 + 流动亮斑）→ 按垂直剖面刷这一列 → 交给合成器
-//
-// 关键点：颜色只沿【沿边方向】变化，垂直方向只走衰减 —— 所以每列只算一次颜色，
-// 然后一路乘 alpha 写下去，省掉了每像素的 HSV 换算。
-static void RenderStrip(Strip& st) {
-    if (!st.px || !st.memDC || !st.hwnd) return;
-    ::memset(st.px, 0, (size_t)st.w * (size_t)st.h * 4);
-
-    const int    T       = st.thick;
-    const int    stride  = st.w;                // 每行 DWORD 数
-    const double invP    = (g_perimeter > 0.0) ? (1.0 / g_perimeter) : 0.0;
-    const double hueSpan = Config::kMarqueeHueSpan;
-    const double waveNum = Config::kMarqueeWaveNum;
-
-    double s = st.sAt0;
-
-    for (int i = 0; i < st.alongLen; ++i, s += st.sStep) {
-        // ---- 色相：沿边铺满一圈 + 随时间整体流动（这就是"环绕流动的 RGB"） ----
-        double hue = Config::kMarqueeHueBase + g_phase + s * invP * hueSpan;
-        while (hue >= 1.0) hue -= 1.0;
-        while (hue < 0.0)  hue += 1.0;
-        const unsigned char* c = &g_hueLut[((int)(hue * 1024.0) & 1023) * 3];
-        const int cr = c[0], cg = c[1], cb = c[2];
-
-        // ---- 沿边流动的亮斑：让整圈不是死板的等亮彩虹 ----
-        const double w = (s * invP) * waveNum + g_wavePhase;
-        const double e = 1.0 - Config::kMarqueeWaveAmp *
-                               (0.5 - 0.5 * std::sin(w * 2.0 * kPi));
-        const int A = (int)(e * g_alpha * 255.0 + 0.5);
-        if (A <= 0) continue;
-
-        // ---- 按垂直剖面刷这一列 ----
-        // p = 从屏幕边缘向内的第几个像素；bufIdx = 它在缓冲区里的行/列号。
-        // 上下边（alongIsX）：i 是列号，p 沿行方向 → 步进 stride*4
-        // 左右边（!alongIsX）：i 是行号，p 沿列方向 → 步进 4
-        unsigned char* col  = st.alongIsX ? (st.px + (size_t)i * 4)
-                                          : (st.px + (size_t)i * stride * 4);
-        const size_t   step = st.alongIsX ? ((size_t)stride * 4) : 4;
-
-        for (int p = 0; p < T; ++p) {
-            const int a = (A * g_prof[p] + 128) >> 8;
-            if (a < 2) break;                    // g_prof 随 p 单调递减，后面全透明，收工
-
-            const int bufIdx = st.perpFlip ? (T - 1 - p) : p;
-
-            // 核心几行掺白 → 亮心（"灯丝"感）
-            const int wm = g_whiteMix[p];
-            int r = cr, g = cg, b = cb;
-            if (wm) {
-                r += ((255 - r) * wm) >> 8;
-                g += ((255 - g) * wm) >> 8;
-                b += ((255 - b) * wm) >> 8;
             }
-
-            unsigned char* d = col + (size_t)bufIdx * step;
-            d[0] = (unsigned char)((b * a + 128) >> 8);   // 预乘 alpha（ULW_ALPHA 要求）
-            d[1] = (unsigned char)((g * a + 128) >> 8);
-            d[2] = (unsigned char)((r * a + 128) >> 8);
-            d[3] = (unsigned char)a;
+            g_hueLut[i * 3 + 0] = (unsigned char)(r * 255.0 + 0.5);
+            g_hueLut[i * 3 + 1] = (unsigned char)(g * 255.0 + 0.5);
+            g_hueLut[i * 3 + 2] = (unsigned char)(b * 255.0 + 0.5);
         }
     }
 
-    POINT src = { 0, 0 };
-    POINT dst = { st.x, st.y };
-    SIZE  sz  = { st.w, st.h };
-    BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
-    ::UpdateLayeredWindow(st.hwnd, nullptr, &dst, &sz, st.memDC, &src, 0, &bf, ULW_ALPHA);
-}
+    // ---- 垂直剖面：核心几行满强度 + 指数辉光衰减 + 核心掺白 ----
+    static void BuildProfile(int thick) {
+        if (thick < 4) thick = 4;
+        g_prof.assign(thick, 0);
+        g_whiteMix.assign(thick, 0);
 
-// ---- 对外接口 ----
-static bool Enabled()    { return g_userOn && g_monCount >= 2; }
-static bool Built()      { return g_built; }
-static bool Busy()       { return g_built && (g_on || g_alpha > 0.004f); }
-static int  MonitorCount(){ return g_monCount; }
-static bool UserOn()     { return g_userOn; }
-static double FrameSec() {
-    static_assert(Config::kMarqueeFps > 0, "kMarqueeFps 必须为正，否则 1.0/x 除零");
-    return 1.0 / (double)Config::kMarqueeFps;
-}
+        const int    core = (Config::kMarqueeCorePx < thick) ? Config::kMarqueeCorePx : 1;
+        const double sigma = (double)thick * Config::kMarqueeGlowDecay;
+        const double sg = (sigma > 1.0) ? sigma : 1.0;
 
-// 托盘菜单切换总开关；关掉时立刻收起
-static void SetUserOn(bool on) {
-    g_userOn = on;
-    if (!on) HideNow();          // HideNow 内部会把 g_on/g_alpha 一起清掉
-}
+        for (int j = 0; j < thick; ++j) {
+            double a = 1.0;
+            if (j >= core) {
+                a = std::exp(-(double)(j - core) / sg);
+                if (a < 0.004) a = 0.0;          // 尾部直接归零，渲染时可以提前 break
+            }
+            g_prof[j] = (unsigned char)(a * 255.0 + 0.5);
 
-// 显示（不重置相位）；已经在显示则什么都不做
-static void Resume() {
-    if (!g_built || g_on) return;
-    g_on     = true;
-    g_lastAt = QpcNow();
-    for (int i = 0; i < kStrips; ++i)
-        if (g_strip[i].hwnd) ::ShowWindow(g_strip[i].hwnd, SW_SHOWNOACTIVATE);
-}
-
-// 从头开始：布局到指定显示器、相位归零、淡入
-static void Start(HMONITOR mon) {
-    if (!Enabled() || !EnsureClass()) return;
-
-    if (g_built && mon != g_builtFor) Destroy();       // 换屏了 → 重新布局
-    if (!g_built) { Layout(mon); g_builtFor = mon; }
-    if (!g_built) return;
-
-    g_phase     = 0.0;                                 // 色相从头开始流
-    g_wavePhase = 0.0;
-    g_alpha     = 0.0f;
-    g_on        = false;                               // 交给 Resume() 显示并刷新时间戳
-    Resume();
-}
-
-static void End() { g_on = false; }
-
-// 出一帧（由主循环按 kMarqueeFps 调度）
-static void Frame() {
-    const double now = QpcNow();
-    double dt = now - g_lastAt;
-    g_lastAt = now;
-    if (dt < 0.0)  dt = 0.0;
-    if (dt > 0.10) dt = 0.10;                          // 卡顿后别让相位跳太多
-
-    const double target = g_on ? 1.0 : 0.0;
-    const double step   = dt / Config::kMarqueeFadeSec;
-    if (g_alpha < target) g_alpha = (float)((g_alpha + step < target) ? g_alpha + step : target);
-    else                  g_alpha = (float)((g_alpha - step > target) ? g_alpha - step : target);
-
-    g_phase += dt / Config::kMarqueeFlowSec;
-    while (g_phase >= 1.0) g_phase -= 1.0;
-
-    g_wavePhase += dt / Config::kMarqueeWaveSec;
-    while (g_wavePhase >= 1.0) g_wavePhase -= 1.0;
-
-    bool any = false;
-    for (int i = 0; i < kStrips; ++i) {
-        Strip& st = g_strip[i];
-        if (!st.hwnd) continue;
-        RenderStrip(st);
-        any = true;
+            // 核心线掺白：前几行二次衰减，做出"灯丝"亮心
+            double wm = 0.0;
+            const int whiteRows = core + 4;
+            if (j < whiteRows) {
+                const double t = 1.0 - (double)j / (double)whiteRows;
+                wm = t * t * Config::kMarqueeCoreWhite;
+            }
+            g_whiteMix[j] = (unsigned char)(wm * 255.0 + 0.5);
+        }
     }
 
-    // 淡出结束就收起来（之后 Busy() 为假，主循环不再为它唤醒）
-    if (!g_on && g_alpha <= 0.004f && any) {
+    static void BuildTables(int thick) {
+        if (!g_tablesReady) { BuildHueLut(); g_tablesReady = true; }
+        BuildProfile(thick);
+    }
+
+    static bool EnsureClass() {
+        static int state = 0;                 // 0=未尝试 1=成功 2=失败
+        if (state == 1) return true;
+        if (state == 2) return false;
+
+        WNDCLASSEXW wc = {};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = ::DefWindowProcW;   // 纯画布，不需要处理任何消息
+        wc.hInstance = g_hInst;
+        wc.lpszClassName = kClass;
+        if (::RegisterClassExW(&wc)) { state = 1; return true; }
+        if (::GetLastError() == ERROR_CLASS_ALREADY_EXISTS) { state = 1; return true; }
+        state = 2;
+        return false;
+    }
+
+    static void ReleaseStrip(Strip& st) {
+        if (st.memDC) {
+            if (st.oldBmp) ::SelectObject(st.memDC, st.oldBmp);
+            ::DeleteDC(st.memDC);
+            st.memDC = nullptr; st.oldBmp = nullptr;
+        }
+        if (st.dib) { ::DeleteObject(st.dib); st.dib = nullptr; }
+        if (st.hwnd) { ::DestroyWindow(st.hwnd); st.hwnd = nullptr; }
+        st.px = nullptr;
+    }
+
+    static bool CreateStrip(Strip& st) {
+        ReleaseStrip(st);
+        if (st.w <= 0 || st.h <= 0) return false;
+
+        st.hwnd = ::CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST |
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            kClass, L"", WS_POPUP, st.x, st.y, st.w, st.h,
+            nullptr, nullptr, g_hInst, nullptr);
+        if (!st.hwnd) return false;
+
+        st.memDC = ::CreateCompatibleDC(nullptr);
+        if (!st.memDC) return false;
+
+        BITMAPV5HEADER bi = {};
+        bi.bV5Size = sizeof(bi);
+        bi.bV5Width = st.w;
+        bi.bV5Height = -st.h;
+        bi.bV5Planes = 1;
+        bi.bV5BitCount = 32;
+        bi.bV5Compression = BI_BITFIELDS;
+        bi.bV5RedMask = 0x00FF0000;
+        bi.bV5GreenMask = 0x0000FF00;
+        bi.bV5BlueMask = 0x000000FF;
+        bi.bV5AlphaMask = 0xFF000000;
+
+        void* bits = nullptr;
+        st.dib = ::CreateDIBSection(st.memDC, (BITMAPINFO*)&bi, DIB_RGB_COLORS,
+            &bits, nullptr, 0);
+        if (!st.dib || !bits) return false;
+
+        st.px = (unsigned char*)bits;
+        st.oldBmp = ::SelectObject(st.memDC, st.dib);
+        ::memset(st.px, 0, (size_t)st.w * (size_t)st.h * 4);
+        return true;
+    }
+
+    // 按目标显示器铺四块边条。
+    //
+    // 四角的"羽化"是这么做的：四条边条都【贯通整条边】—— 左右两条贯穿整屏高度、
+    // 上下两条贯穿整屏宽度，于是每个角落的 T×T 方块由相邻两条边条【重叠】渲染。
+    // 分层窗口的 over 合成天然近似"取并集"：1-(1-a)(1-b) ≥ max(a,b)，
+    // 水平辉光与垂直辉光在角落互相补齐 —— 正是一根弯过角落的霓虹管该有的样子。
+    // 旧版让左右两条"让开四角"，结果是垂直光带在 y=top+T 处以满强度突然出现
+    // （水平辉光在那里已衰减到 ~3%），沿边缘出现 3%→100% 的生硬断口 —— 已废弃。
+    //
+    // 弧长参数按真实周长精确衔接（像素步进数 L = 2(W-1)+2(H-1)）：
+    //   上 0..W-1 → 右 W-1..W+H-2 → 下 W+H-2..2W+H-3 → 左 2W+H-3..2W+2H-4
+    // 四个角点处两条边的 s 完全相等，hue 与亮斑相位过角零跳变。
+    static void Layout(HMONITOR mon) {
+        MONITORINFO mi = {};
+        mi.cbSize = sizeof(mi);
+        if (!::GetMonitorInfoW(mon, &mi)) return;
+
+        const RECT r = mi.rcMonitor;
+        const int  W = r.right - r.left;
+        const int  H = r.bottom - r.top;
+
+        // 光带厚度按屏幕短边取比例，保证不同尺寸屏幕上观感一致
+        int T = (int)((W < H ? W : H) * Config::kMarqueeThickRatio + 0.5);
+        if (T < Config::kMarqueeThickMin) T = Config::kMarqueeThickMin;
+        if (T > Config::kMarqueeThickMax) T = Config::kMarqueeThickMax;
+        const int lim = ((W < H ? W : H) / 4);
+        if (T > lim) T = lim;
+        if (T < 4)   T = 4;
+
+        if (W < 2 * T + 8 || H < 2 * T + 8) return;   // 屏太小，角落会吞掉整条边，算了
+
+        BuildTables(T);
+
+        g_perimeter = 2.0 * (W + H) - 4.0;            // 色相/亮斑归一化的真实周长
+
+        // 上边：x = 0..W-1 → s = 0..W-1（右上角 s=W-1 与右边条起点精确相等）
+        Strip& top = g_strip[0];
+        top.x = r.left; top.y = r.top; top.w = W; top.h = T;
+        top.alongIsX = true; top.perpFlip = false;
+        top.thick = T; top.alongLen = W;
+        top.sAt0 = 0.0; top.sStep = 1.0;
+
+        // 右边：贯通整屏高度。y = 0..H-1 → s = W-1..W+H-2
+        Strip& right = g_strip[1];
+        right.x = r.right - T; right.y = r.top;
+        right.w = T; right.h = H;
+        right.alongIsX = false; right.perpFlip = true;
+        right.thick = T; right.alongLen = H;
+        right.sAt0 = (double)(W - 1); right.sStep = 1.0;
+
+        // 下边：x = 0..W-1 → s = 2W+H-3 .. W+H-2（右下角与左边条起点精确相等）
+        Strip& bottom = g_strip[2];
+        bottom.x = r.left; bottom.y = r.bottom - T; bottom.w = W; bottom.h = T;
+        bottom.alongIsX = true; bottom.perpFlip = true;
+        bottom.thick = T; bottom.alongLen = W;
+        bottom.sAt0 = (double)(2 * W + H - 3); bottom.sStep = -1.0;
+
+        // 左边：贯通整屏高度。y = 0..H-1 → s = 2W+2H-4 .. 2W+H-3
+        // （顶端 s=2W+2H-4=L 回绕到上边起点的 s=0，闭环成立）
+        Strip& left = g_strip[3];
+        left.x = r.left; left.y = r.top;
+        left.w = T; left.h = H;
+        left.alongIsX = false; left.perpFlip = false;
+        left.thick = T; left.alongLen = H;
+        left.sAt0 = (double)(2 * W + 2 * H - 4); left.sStep = -1.0;
+
+        g_built = true;
+        for (int i = 0; i < kStrips; ++i) CreateStrip(g_strip[i]);
+    }
+
+    static void Destroy() {
+        for (int i = 0; i < kStrips; ++i) ReleaseStrip(g_strip[i]);
+        g_built = false;
+        g_alpha = 0.0f;
+        g_on = false;
+    }
+
+    static void HideNow() {
+        g_on = false;
         g_alpha = 0.0f;
         for (int i = 0; i < kStrips; ++i)
             if (g_strip[i].hwnd) ::ShowWindow(g_strip[i].hwnd, SW_HIDE);
     }
-}
 
-// 显示器数量变化（启动、WM_DISPLAYCHANGE）时调用
-static void RefreshMonitorCount() {
-    int n = ::GetSystemMetrics(SM_CMONITORS);
-    if (n < 1) n = 1;
-    if (n == g_monCount) return;
-    g_monCount = n;
-    Destroy();          // 数量变了：先收掉，等下次触发时按新布局重建
-}
+    // 沿边逐列：算出该列的颜色（色相环绕 + 流动亮斑）→ 按垂直剖面刷这一列 → 交给合成器
+    //
+    // 关键点：颜色只沿【沿边方向】变化，垂直方向只走衰减 —— 所以每列只算一次颜色，
+    // 然后一路乘 alpha 写下去，省掉了每像素的 HSV 换算。
+    static void RenderStrip(Strip& st) {
+        if (!st.px || !st.memDC || !st.hwnd) return;
+        ::memset(st.px, 0, (size_t)st.w * (size_t)st.h * 4);
+
+        const int    T = st.thick;
+        const int    stride = st.w;                // 每行 DWORD 数
+        const double invP = (g_perimeter > 0.0) ? (1.0 / g_perimeter) : 0.0;
+        const double hueSpan = Config::kMarqueeHueSpan;
+        const double waveNum = Config::kMarqueeWaveNum;
+
+        double s = st.sAt0;
+
+        for (int i = 0; i < st.alongLen; ++i, s += st.sStep) {
+            // ---- 色相：沿边铺满一圈 + 随时间整体流动（这就是"环绕流动的 RGB"） ----
+            double hue = Config::kMarqueeHueBase + g_phase + s * invP * hueSpan;
+            while (hue >= 1.0) hue -= 1.0;
+            while (hue < 0.0)  hue += 1.0;
+            const unsigned char* c = &g_hueLut[((int)(hue * 1024.0) & 1023) * 3];
+            const int cr = c[0], cg = c[1], cb = c[2];
+
+            // ---- 沿边流动的亮斑：让整圈不是死板的等亮彩虹 ----
+            const double w = (s * invP) * waveNum + g_wavePhase;
+            const double e = 1.0 - Config::kMarqueeWaveAmp *
+                (0.5 - 0.5 * std::sin(w * 2.0 * kPi));
+            const int A = (int)(e * g_alpha * 255.0 + 0.5);
+            if (A <= 0) continue;
+
+            // ---- 按垂直剖面刷这一列 ----
+            // p = 从屏幕边缘向内的第几个像素；bufIdx = 它在缓冲区里的行/列号。
+            // 上下边（alongIsX）：i 是列号，p 沿行方向 → 步进 stride*4
+            // 左右边（!alongIsX）：i 是行号，p 沿列方向 → 步进 4
+            unsigned char* col = st.alongIsX ? (st.px + (size_t)i * 4)
+                : (st.px + (size_t)i * stride * 4);
+            const size_t   step = st.alongIsX ? ((size_t)stride * 4) : 4;
+
+            for (int p = 0; p < T; ++p) {
+                const int a = (A * g_prof[p] + 128) >> 8;
+                if (a < 2) break;                    // g_prof 随 p 单调递减，后面全透明，收工
+
+                const int bufIdx = st.perpFlip ? (T - 1 - p) : p;
+
+                // 核心几行掺白 → 亮心（"灯丝"感）
+                const int wm = g_whiteMix[p];
+                int r = cr, g = cg, b = cb;
+                if (wm) {
+                    r += ((255 - r) * wm) >> 8;
+                    g += ((255 - g) * wm) >> 8;
+                    b += ((255 - b) * wm) >> 8;
+                }
+
+                unsigned char* d = col + (size_t)bufIdx * step;
+                d[0] = (unsigned char)((b * a + 128) >> 8);   // 预乘 alpha（ULW_ALPHA 要求）
+                d[1] = (unsigned char)((g * a + 128) >> 8);
+                d[2] = (unsigned char)((r * a + 128) >> 8);
+                d[3] = (unsigned char)a;
+            }
+        }
+
+        POINT src = { 0, 0 };
+        POINT dst = { st.x, st.y };
+        SIZE  sz = { st.w, st.h };
+        BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+        ::UpdateLayeredWindow(st.hwnd, nullptr, &dst, &sz, st.memDC, &src, 0, &bf, ULW_ALPHA);
+    }
+
+    // ---- 对外接口 ----
+    static bool Enabled() { return g_userOn && g_monCount >= 2; }
+    static bool Built() { return g_built; }
+    static bool Busy() { return g_built && (g_on || g_alpha > 0.004f); }
+    static int  MonitorCount() { return g_monCount; }
+    static bool UserOn() { return g_userOn; }
+    static double FrameSec() {
+        static_assert(Config::kMarqueeFps > 0, "kMarqueeFps 必须为正，否则 1.0/x 除零");
+        return 1.0 / (double)Config::kMarqueeFps;
+    }
+
+    // 托盘菜单切换总开关；关掉时立刻收起
+    static void SetUserOn(bool on) {
+        g_userOn = on;
+        if (!on) HideNow();          // HideNow 内部会把 g_on/g_alpha 一起清掉
+    }
+
+    // 显示（不重置相位）；已经在显示则什么都不做
+    static void Resume() {
+        if (!g_built || g_on) return;
+        g_on = true;
+        g_lastAt = QpcNow();
+        for (int i = 0; i < kStrips; ++i)
+            if (g_strip[i].hwnd) ::ShowWindow(g_strip[i].hwnd, SW_SHOWNOACTIVATE);
+    }
+
+    // 从头开始：布局到指定显示器、相位归零、淡入
+    static void Start(HMONITOR mon) {
+        if (!Enabled() || !EnsureClass()) return;
+
+        if (g_built && mon != g_builtFor) Destroy();       // 换屏了 → 重新布局
+        if (!g_built) { Layout(mon); g_builtFor = mon; }
+        if (!g_built) return;
+
+        g_phase = 0.0;                                 // 色相从头开始流
+        g_wavePhase = 0.0;
+        g_alpha = 0.0f;
+        g_on = false;                               // 交给 Resume() 显示并刷新时间戳
+        Resume();
+    }
+
+    static void End() { g_on = false; }
+
+    // 出一帧（由主循环按 kMarqueeFps 调度）
+    static void Frame() {
+        const double now = QpcNow();
+        double dt = now - g_lastAt;
+        g_lastAt = now;
+        if (dt < 0.0)  dt = 0.0;
+        if (dt > 0.10) dt = 0.10;                          // 卡顿后别让相位跳太多
+
+        const double target = g_on ? 1.0 : 0.0;
+        const double step = dt / Config::kMarqueeFadeSec;
+        if (g_alpha < target) g_alpha = (float)((g_alpha + step < target) ? g_alpha + step : target);
+        else                  g_alpha = (float)((g_alpha - step > target) ? g_alpha - step : target);
+
+        g_phase += dt / Config::kMarqueeFlowSec;
+        while (g_phase >= 1.0) g_phase -= 1.0;
+
+        g_wavePhase += dt / Config::kMarqueeWaveSec;
+        while (g_wavePhase >= 1.0) g_wavePhase -= 1.0;
+
+        bool any = false;
+        for (int i = 0; i < kStrips; ++i) {
+            Strip& st = g_strip[i];
+            if (!st.hwnd) continue;
+            RenderStrip(st);
+            any = true;
+        }
+
+        // 淡出结束就收起来（之后 Busy() 为假，主循环不再为它唤醒）
+        if (!g_on && g_alpha <= 0.004f && any) {
+            g_alpha = 0.0f;
+            for (int i = 0; i < kStrips; ++i)
+                if (g_strip[i].hwnd) ::ShowWindow(g_strip[i].hwnd, SW_HIDE);
+        }
+    }
+
+    // 显示器数量变化（启动、WM_DISPLAYCHANGE）时调用
+    static void RefreshMonitorCount() {
+        int n = ::GetSystemMetrics(SM_CMONITORS);
+        if (n < 1) n = 1;
+        if (n == g_monCount) return;
+        g_monCount = n;
+        Destroy();          // 数量变了：先收掉，等下次触发时按新布局重建
+    }
 
 }  // namespace Marquee
 
 // 触发放大（已在放大态时只刷新计时，不重启动画）
 static void OnTrigger(ULONGLONG now) {
     g_lastTrigger = now;
-    g_lastActive  = now;
+    g_lastActive = now;
 
     if (g_target < Config::kScaleMax - 0.001f) {
         g_enlarged = true;
-        g_target   = Config::kScaleMax;
+        g_target = Config::kScaleMax;
         StartAnim(g_scale, Config::kScaleMax, Config::kGrowMs / 1000.0);
         // 多显示器时，在光标所在那块屏的四边拉起跑马灯
         Marquee::Start(g_mon);
-    } else {
+    }
+    else {
         g_enlarged = true;   // 已经在最大尺度，仅续命
     }
 }
@@ -1202,17 +1254,29 @@ static void Tick() {
         return;
     }
 
-    if (moving) {
-        // 运动中：若正处在回缩过程中，则立刻反向放大回去
+    // ---- 放大态：每个采样周期(kPollMs = 16ms)获取一次当前鼠标速度 ----
+    //   curSpeed >= kSlowSpeed → 仍在"晃 / 快速移动"：续命；若正处于回缩中则立刻反向放大。
+    //   curSpeed <  kSlowSpeed → 慢下来了：满足最短保持时间后触发缩小动画。
+    double curSpeed = 0.0;
+    if (moved) {
+        const Motion recent = WindowStats(Config::kCalmWindowSec);
+        if (recent.valid) curSpeed = recent.speed;
+    }
+
+    if (curSpeed >= Config::kSlowSpeed) {
+        // 速度够快 → 刷新"最近活跃"时刻，并打断正在进行的回缩
+        g_lastActive = now;
         if (g_target < Config::kScaleMax - 0.001f) {
             g_target = Config::kScaleMax;
             StartAnim(g_scale, Config::kScaleMax, Config::kGrowMs / 1000.0);
             Marquee::Resume();          // 跑马灯也收回淡出状态
         }
-    } else if (g_target > Config::kScaleMin + 0.001f &&
-               (now - g_lastActive)  >= (DWORD)Config::kCalmDelayMs &&
-               (now - g_lastTrigger) >= (DWORD)Config::kMinHoldMs) {
-        // 已平缓足够久：开始平滑回缩（跑马灯不在这里收，等缩回到位再说）
+    }
+    else if (g_target > Config::kScaleMin + 0.001f &&
+        (now - g_lastActive) >= (DWORD)Config::kCalmDelayMs &&
+        (now - g_lastTrigger) >= (DWORD)Config::kMinHoldMs) {
+        // 速度低于 kSlowSpeed 且已持续 kCalmDelayMs：开始平滑回缩
+        //（跑马灯不在这里收，等缩回到位、g_enlarged 归 false 时再淡出）
         g_target = Config::kScaleMin;
         StartAnim(g_scale, Config::kScaleMin, Config::kShrinkMs / 1000.0);
     }
@@ -1222,8 +1286,8 @@ static void Tick() {
 static void ForceRestore() {
     StopAnim();
     Marquee::HideNow();
-    g_scale    = Config::kScaleMin;
-    g_target   = Config::kScaleMin;
+    g_scale = Config::kScaleMin;
+    g_target = Config::kScaleMin;
     g_enlarged = false;
     g_history.clear();
     RestoreSystemCursor();
@@ -1250,14 +1314,15 @@ static bool IsAutoStartSet() {
 static void SetAutoStart(bool on) {
     HKEY key;
     if (::RegCreateKeyExW(HKEY_CURRENT_USER, kRunKey, 0, nullptr, 0,
-                          KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS)
+        KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS)
         return;
     if (on) {
         std::wstring path = GetExePath();
         ::RegSetValueExW(key, kAppName, 0, REG_SZ,
-                         (BYTE*)path.c_str(),
-                         (DWORD)((path.size() + 1) * sizeof(wchar_t)));
-    } else {
+            (BYTE*)path.c_str(),
+            (DWORD)((path.size() + 1) * sizeof(wchar_t)));
+    }
+    else {
         ::RegDeleteValueW(key, kAppName);
     }
     ::RegCloseKey(key);
@@ -1277,7 +1342,8 @@ static void ShowTrayMenu(POINT pt) {
     if (monCount >= 2) {
         ::AppendMenuW(menu, MF_STRING, 4, L"多屏跑马灯");
         ::CheckMenuItem(menu, 4, MF_BYCOMMAND | (Marquee::UserOn() ? MF_CHECKED : MF_UNCHECKED));
-    } else {
+    }
+    else {
         ::AppendMenuW(menu, MF_STRING | MF_GRAYED, 4, L"多屏跑马灯（仅一个显示器）");
     }
 
@@ -1288,25 +1354,25 @@ static void ShowTrayMenu(POINT pt) {
 
     ::SetForegroundWindow(g_hwnd);
     int cmd = ::TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY,
-                               pt.x, pt.y, 0, g_hwnd, nullptr);
+        pt.x, pt.y, 0, g_hwnd, nullptr);
     ::DestroyMenu(menu);
 
     switch (cmd) {
-        case 1:
-            g_enabled = !g_enabled;
-            if (!g_enabled) ForceRestore();
-            break;
-        case 2:
-            SetAutoStart(!IsAutoStartSet());
-            break;
-        case 3:
-            ::PostMessageW(g_hwnd, WM_COMMAND, 3, 0);
-            break;
-        case 4:
-            Marquee::SetUserOn(!Marquee::UserOn());
-            break;
-        default:
-            break;
+    case 1:
+        g_enabled = !g_enabled;
+        if (!g_enabled) ForceRestore();
+        break;
+    case 2:
+        SetAutoStart(!IsAutoStartSet());
+        break;
+    case 3:
+        ::PostMessageW(g_hwnd, WM_COMMAND, 3, 0);
+        break;
+    case 4:
+        Marquee::SetUserOn(!Marquee::UserOn());
+        break;
+    default:
+        break;
     }
 }
 
@@ -1315,70 +1381,70 @@ static void ShowTrayMenu(POINT pt) {
 // ===========================================================================
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
-        case WM_CREATE:
-            // 采样与动画帧统一由主循环的可等待定时器驱动，这里不再用 WM_TIMER
-            g_nid.cbSize = sizeof(g_nid);
-            g_nid.hWnd   = hwnd;
-            g_nid.uID    = 1;
-            g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
-            g_nid.uCallbackMessage = WM_TRAYICON;
-            // 托盘图标优先用内嵌的应用图标（app.ico，资源 ID 1）；
-            // 资源缺失时退回系统箭头图形，再退回通用应用图标。
-            g_nid.hIcon = (HICON)::LoadImageW(g_hInst, MAKEINTRESOURCEW(1), IMAGE_ICON,
-                                              ::GetSystemMetrics(SM_CXICON),
-                                              ::GetSystemMetrics(SM_CYICON), LR_SHARED);
-            if (!g_nid.hIcon)
-                g_nid.hIcon = (HICON)::LoadImage(nullptr, MAKEINTRESOURCE(OCR_NORMAL),
-                                                 IMAGE_CURSOR, 0, 0, LR_SHARED);
-            if (!g_nid.hIcon) g_nid.hIcon = ::LoadIcon(nullptr, IDI_APPLICATION);
-            wcscpy_s(g_nid.szTip, L"ShakeFindCursor — 摇动鼠标放大指针");
-            ::Shell_NotifyIconW(NIM_ADD, &g_nid);
-            g_trayAdded = true;
-            return 0;
+    case WM_CREATE:
+        // 采样与动画帧统一由主循环的可等待定时器驱动，这里不再用 WM_TIMER
+        g_nid.cbSize = sizeof(g_nid);
+        g_nid.hWnd = hwnd;
+        g_nid.uID = 1;
+        g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+        g_nid.uCallbackMessage = WM_TRAYICON;
+        // 托盘图标优先用内嵌的应用图标（app.ico，资源 ID 1）；
+        // 资源缺失时退回系统箭头图形，再退回通用应用图标。
+        g_nid.hIcon = (HICON)::LoadImageW(g_hInst, MAKEINTRESOURCEW(1), IMAGE_ICON,
+            ::GetSystemMetrics(SM_CXICON),
+            ::GetSystemMetrics(SM_CYICON), LR_SHARED);
+        if (!g_nid.hIcon)
+            g_nid.hIcon = (HICON)::LoadImage(nullptr, MAKEINTRESOURCE(OCR_NORMAL),
+                IMAGE_CURSOR, 0, 0, LR_SHARED);
+        if (!g_nid.hIcon) g_nid.hIcon = ::LoadIcon(nullptr, IDI_APPLICATION);
+        wcscpy_s(g_nid.szTip, L"ShakeFindCursor — 摇动鼠标放大指针");
+        ::Shell_NotifyIconW(NIM_ADD, &g_nid);
+        g_trayAdded = true;
+        return 0;
 
-        case WM_TRAYICON:
-            if (lp == WM_RBUTTONUP || lp == WM_LBUTTONUP) {
-                POINT pt;
-                ::GetCursorPos(&pt);
-                ShowTrayMenu(pt);
-            }
-            return 0;
+    case WM_TRAYICON:
+        if (lp == WM_RBUTTONUP || lp == WM_LBUTTONUP) {
+            POINT pt;
+            ::GetCursorPos(&pt);
+            ShowTrayMenu(pt);
+        }
+        return 0;
 
-        case WM_DISPLAYCHANGE:        // 分辨率 / 刷新率 / 显示器数量变了
-            g_mon = nullptr;
-            Marquee::RefreshMonitorCount();
-            return 0;
+    case WM_DISPLAYCHANGE:        // 分辨率 / 刷新率 / 显示器数量变了
+        g_mon = nullptr;
+        Marquee::RefreshMonitorCount();
+        return 0;
 
-        case WM_COMMAND:
-            if (LOWORD(wp) == 3) {
-                g_shutdown = true;
-                ForceRestore();
-                ::PostMessageW(hwnd, WM_CLOSE, 0, 0);
-            }
-            return 0;
-
-        case WM_QUERYENDSESSION:      // 注销 / 关机询问
+    case WM_COMMAND:
+        if (LOWORD(wp) == 3) {
+            g_shutdown = true;
             ForceRestore();
-            return TRUE;
+            ::PostMessageW(hwnd, WM_CLOSE, 0, 0);
+        }
+        return 0;
 
-        case WM_ENDSESSION:           // 注销 / 关机确认
-            if (wp) ForceRestore();
-            return 0;
+    case WM_QUERYENDSESSION:      // 注销 / 关机询问
+        ForceRestore();
+        return TRUE;
 
-        case WM_CLOSE:
-            ::DestroyWindow(hwnd);
-            return 0;
+    case WM_ENDSESSION:           // 注销 / 关机确认
+        if (wp) ForceRestore();
+        return 0;
 
-        case WM_DESTROY:
-            if (g_trayAdded) ::Shell_NotifyIconW(NIM_DELETE, &g_nid);
-            StopAnim();
-            Marquee::Destroy();
-            RestoreSystemCursor();
-            ::PostQuitMessage(0);
-            return 0;
+    case WM_CLOSE:
+        ::DestroyWindow(hwnd);
+        return 0;
 
-        default:
-            return ::DefWindowProcW(hwnd, msg, wp, lp);
+    case WM_DESTROY:
+        if (g_trayAdded) ::Shell_NotifyIconW(NIM_DELETE, &g_nid);
+        StopAnim();
+        Marquee::Destroy();
+        RestoreSystemCursor();
+        ::PostQuitMessage(0);
+        return 0;
+
+    default:
+        return ::DefWindowProcW(hwnd, msg, wp, lp);
     }
 }
 
@@ -1404,13 +1470,13 @@ static void StartWatchdog() {
     if (::GetModuleFileNameW(nullptr, exe, MAX_PATH) == 0) return;
 
     std::wstring cmd = L"\"" + std::wstring(exe) + L"\" --watchdog " +
-                       std::to_wstring((unsigned long)::GetCurrentProcessId());
+        std::to_wstring((unsigned long)::GetCurrentProcessId());
 
     STARTUPINFOW si = {};
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi = {};
     if (::CreateProcessW(exe, &cmd[0], nullptr, nullptr, FALSE,
-                         CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
         ::CloseHandle(pi.hThread);
         ::CloseHandle(pi.hProcess);
     }
@@ -1459,7 +1525,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ PWSTR pCm
     // 否则跑马灯图层会被 DWM 拉伸而发糊。旧系统上退化为"系统级 DPI 感知"。
     // 动态取函数指针，避免导入表在旧 Windows 上直接加载失败。
     {
-        typedef BOOL (WINAPI *PFN_SetDpiCtx)(HANDLE);
+        typedef BOOL(WINAPI* PFN_SetDpiCtx)(HANDLE);
         HMODULE user32 = ::GetModuleHandleW(L"user32.dll");
         PFN_SetDpiCtx fn = user32
             ? (PFN_SetDpiCtx)::GetProcAddress(user32, "SetProcessDpiAwarenessContext")
@@ -1484,7 +1550,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ PWSTR pCm
     // timeBeginPeriod 会把整个系统的时钟分辨率抬到 1ms，阻止 CPU 进入深度睡眠，
     // 是持续耗电的大头 —— 这个 API 就是为了取代它而生的（Win10 1803+）。
     g_animTimer = ::CreateWaitableTimerExW(nullptr, nullptr,
-                     CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     if (!g_animTimer) {
         // 老系统兜底：普通可等待定时器（精度受系统节拍限制，但功能正常）
         g_animTimer = ::CreateWaitableTimerW(nullptr, FALSE, nullptr);
@@ -1503,7 +1569,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ PWSTR pCm
     ULONG_PTR gdiplusToken = 0;
     if (Gdiplus::GdiplusStartup(&gdiplusToken, &gsi, nullptr) != Gdiplus::Ok) {
         if (g_animTimer) { ::CloseHandle(g_animTimer); g_animTimer = nullptr; }
-        if (g_memDC)     { ::DeleteDC(g_memDC); g_memDC = nullptr; }
+        if (g_memDC) { ::DeleteDC(g_memDC); g_memDC = nullptr; }
         return 1;
     }
 
@@ -1513,14 +1579,14 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ PWSTR pCm
     else                       g_nativePx = Config::kNativePx;
 
     WNDCLASSEXW wc = {};
-    wc.cbSize        = sizeof(wc);
-    wc.lpfnWndProc   = WndProc;
-    wc.hInstance     = hInstance;
-    wc.hIcon         = (HICON)::LoadImageW(hInstance, MAKEINTRESOURCEW(1),
-                                           IMAGE_ICON, 0, 0, LR_SHARED);
-    wc.hIconSm       = (HICON)::LoadImageW(hInstance, MAKEINTRESOURCEW(1), IMAGE_ICON,
-                                           ::GetSystemMetrics(SM_CXSMICON),
-                                           ::GetSystemMetrics(SM_CYSMICON), LR_SHARED);
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = hInstance;
+    wc.hIcon = (HICON)::LoadImageW(hInstance, MAKEINTRESOURCEW(1),
+        IMAGE_ICON, 0, 0, LR_SHARED);
+    wc.hIconSm = (HICON)::LoadImageW(hInstance, MAKEINTRESOURCEW(1), IMAGE_ICON,
+        ::GetSystemMetrics(SM_CXSMICON),
+        ::GetSystemMetrics(SM_CYSMICON), LR_SHARED);
     wc.lpszClassName = L"ShakeFindCursorWnd";
     if (!::RegisterClassExW(&wc)) {
         Gdiplus::GdiplusShutdown(gdiplusToken);
@@ -1530,8 +1596,8 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ PWSTR pCm
     }
 
     g_hwnd = ::CreateWindowExW(0, wc.lpszClassName, kAppName,
-                               WS_OVERLAPPED, 0, 0, 0, 0,
-                               nullptr, nullptr, hInstance, nullptr);
+        WS_OVERLAPPED, 0, 0, 0, 0,
+        nullptr, nullptr, hInstance, nullptr);
     if (!g_hwnd) {
         Gdiplus::GdiplusShutdown(gdiplusToken);
         if (g_animTimer) ::CloseHandle(g_animTimer);
@@ -1554,9 +1620,9 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ PWSTR pCm
     // ⚠️ 必须每次都把消息排空：早先的写法在动画帧分支里 `continue` 跳过了排空，
     //    消息会在队列里积压，之后 MsgWaitForMultipleObjectsEx 便不再为"已经在队列里"
     //    的输入返回 → 整个程序假死（轮询停摆、指针卡在放大状态回不来）。
-    const double pollSec    = Config::kPollMs / 1000.0;
+    const double pollSec = Config::kPollMs / 1000.0;
     const double marqueeSec = Marquee::FrameSec();
-    double nextPollAt    = QpcNow() + pollSec;
+    double nextPollAt = QpcNow() + pollSec;
     double nextMarqueeAt = 0.0;          // 0 = 跑马灯未排期
 
     bool done = false;
@@ -1573,15 +1639,16 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ PWSTR pCm
             if (wait < 0.0002) wait = 0.0002;
 
             if (g_animTimer) {
-                LARGE_INTEGER due;
+                LARGE_INTEGER due{};
                 due.QuadPart = -(LONGLONG)(wait * 1e7 + 1.0);  // 负数 = 相对时间(100ns)
                 ::SetWaitableTimer(g_animTimer, &due, 0, nullptr, nullptr, FALSE);
                 ::MsgWaitForMultipleObjectsEx(1, &g_animTimer, INFINITE, QS_ALLINPUT,
-                                              MWMO_INPUTAVAILABLE);
-            } else {
+                    MWMO_INPUTAVAILABLE);
+            }
+            else {
                 // 极端兜底：连普通可等待定时器都建不出来时，用带超时的等待
                 ::MsgWaitForMultipleObjectsEx(0, nullptr, (DWORD)(wait * 1000.0) + 1,
-                                              QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+                    QS_ALLINPUT, MWMO_INPUTAVAILABLE);
             }
         }
 
@@ -1600,10 +1667,11 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ PWSTR pCm
                 if (nextMarqueeAt <= 0.0 || t >= nextMarqueeAt) {
                     Marquee::Frame();
                     nextMarqueeAt = (nextMarqueeAt <= 0.0) ? (t + marqueeSec)
-                                                           : (nextMarqueeAt + marqueeSec);
+                        : (nextMarqueeAt + marqueeSec);
                     if (nextMarqueeAt <= t) nextMarqueeAt = t + marqueeSec;
                 }
-            } else {
+            }
+            else {
                 nextMarqueeAt = 0.0;
             }
         }
@@ -1622,7 +1690,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ PWSTR pCm
     RestoreSystemCursor();
     FreeCursorBits();
     if (g_animTimer) { ::CloseHandle(g_animTimer); g_animTimer = nullptr; }
-    if (g_memDC)     { ::DeleteDC(g_memDC);        g_memDC     = nullptr; }
+    if (g_memDC) { ::DeleteDC(g_memDC);        g_memDC = nullptr; }
     Gdiplus::GdiplusShutdown(gdiplusToken);
     return 0;
 }
