@@ -5,6 +5,22 @@
 // 经 CreateIconIndirect 生成 HCURSOR 后 SetSystemCursor 全局替换。
 // 不需要管理员权限。
 // ---------------------------------------------------------------------------
+// v5.0 运动学判定改用 Raw Input（物理位移），彻底脱离系统鼠标速度
+// ---------------------------------------------------------------------------
+// 问题：GetCursorPos 返回的是经过「控制面板 → 鼠标速度滑块 + 提高指针精确度」
+//       处理之后的【屏幕像素】。用户把滑块从 10 调到 15，同样的手部动作在屏幕上
+//       就多跑 50%，于是所有基于像素的阈值（kShakeSpeed / kShakeMinAmpPx /
+//       kCalmSpeed / kSlowSpeed …）全部变松 —— 轻抖就能触发，手停下来要拖
+//       更久才回缩。
+// 对策：注册 Raw Input（RIDEV_INPUTSINK），从 WM_INPUT 里取 RAWMOUSE 的
+//       lLastX / lLastY —— 这是【未经系统缩放】的设备计数。所有运动统计都建立
+//       在这条累加出来的虚拟轨迹上，配置在不同鼠标速度下滑块下完全一致。
+// 兼容：某些设备/远程桌面只报 MOUSE_MOVE_ABSOLUTE（0..65535 归一化坐标），
+//       语义不同，直接跳过；若 Raw Input 完全注册失败，则退化回 GetCursorPos
+//       （此时行为等价 v4.9，不做鼠标速度归一化）。
+// 单位：Config 里所有 Px / Speed 后缀的阈值现在都以「鼠标计数」为单位，
+//       在常见 800~1600 DPI 鼠标 + 默认速度(10) 下与旧像素阈值近似 1:1。
+// ---------------------------------------------------------------------------
 // v4.9 放大后按固定周期采样速度，低于 kSlowSpeed 即触发缩小动画
 // ---------------------------------------------------------------------------
 // 需求：放大状态下，每 16ms（kPollMs）获取一次当前鼠标速度；速度低于
@@ -163,6 +179,10 @@ namespace Config {
     const int      kPollMs = 16;     // 位移采样间隔(ms)
     const int      kHistoryMs = 760;    // 轨迹保留时长(ms)，需 >= 最长的判定窗口
     const size_t   kHistoryMax = 200;    // 轨迹采样上限（防极端情况下膨胀）
+    // v5.0：Raw Input 到得比 Tick 快得多（1000Hz 鼠标 = 1ms 一个事件），
+    //       历史里堆 1000 个样本做摆动分析毫无必要，反而白烧 CPU。
+    //       因此按 8ms 节流：位移已全部累加，样本只是"读数的标尺"。
+    const int      kRawThrottleMs = 16;
 
     // ---------------- 触发通道 A：快速直线滑动 ----------------
     // macOS 没有这个机制（它只认来回摆动）。打开后"快速甩一下鼠标"就会放大，
@@ -174,18 +194,18 @@ namespace Config {
     const double   kSwipeStraight = 0.85;   // 直线度 = 净位移 / 路径长度，1.0 为绝对笔直
 
     // ---------------- 触发通道 B：快速晃动（对齐 macOS 手感）----------------
-    const double   kShakeWindowSec = 0.75;   // 数"有效摆动次数"的时间窗(秒)
-    const double   kShakeMinAmpPx = 25.0;   // 一次摆动至少要反向回撤这么多像素才算数
+    const double   kShakeWindowSec = 0.50;   // 数"有效摆动次数"的时间窗(秒)
+    const double   kShakeMinAmpPx = 50.0;   // 一次摆动至少要反向回撤这么多像素才算数
     const int      kShakeReversals = 5;      // 窗口内至少几次有效摆动（≈ 来回晃两下）
     const double   kShakeSpeedSec = 0.50;   // 看"当前速度"的时间窗(秒)
-    const double   kShakeSpeed = 500.0;  // 速度下限(px/s)，够快才算"晃"
+    const double   kShakeSpeed = 1200.0;  // 速度下限(px/s)，够快才算"晃"
     const double   kShakeMaxNetRatio = 0.5; // 净位移/路程 上限：必须是"来回摆"，不是长距离拖动  
 
     // ---------------- 恢复（平缓判定） ----------------
     const double   kCalmWindowSec = 0.22;   // 测"当前速度"用的窗口(秒)，取长一点以免摆动转折点误判为停下
-    const double   kCalmSpeed = 150.0;  // 低于此速度视为"平缓"(px/s)
-    const double   kSlowSpeed = 2000.0;  // 当前鼠标速度低于此值(px/s) → 触发缩小动画
-    const int      kCalmDelayMs = 0;    // 持续平缓多久开始回缩(ms)
+    const double   kCalmSpeed = 300.0;  // 低于此速度视为"平缓"(px/s)
+    const double   kSlowSpeed = 3000.0;  // 当前鼠标速度低于此值(px/s) → 触发缩小动画
+    const int      kCalmDelayMs = 0;    // 持续平缓多久开始回缩(ms)  非0不能"放大后鼠标低速时缩小光标"
     const int      kMinHoldMs = 500;    // 每次触发后至少放大这么久(ms)，避免闪烁
 
     // ---------------- 缩放动画 ----------------
@@ -248,8 +268,17 @@ static bool      g_enabled = true;
 static bool      g_shutdown = false;
 
 // 轨迹采样
-struct Sample { POINT pt; ULONGLONG when; };
+// v5.0：坐标来源从"屏幕像素"改为"Raw Input 累加位置"——即设备计数。
+//       用 double 防长时间累加溢出，也保精度。
+struct Sample { double x; double y; ULONGLONG when; };
 static std::deque<Sample> g_history;
+
+// v5.0：Raw Input 状态
+static bool       g_rawReady = false;         // 注册成功？
+static double     g_rawPosX = 0.0;            // 累加后的原始位置（设备计数）
+static double     g_rawPosY = 0.0;
+static ULONGLONG  g_rawLastEventMs = 0;       // 最近一次 WM_INPUT 的时间
+static POINT      g_fallbackLastPt = { INT_MIN, INT_MIN };  // 回退路径用
 
 // 缩放状态机
 static float g_scale = Config::kScaleMin;  // 当前尺度
@@ -302,8 +331,31 @@ static std::wstring GetExePath();
 // ===========================================================================
 // 轨迹与运动学统计
 // ===========================================================================
-static void RecordMove(POINT pt, ULONGLONG now) {
-    g_history.push_back({ pt, now });
+// v5.0：注册鼠标原始输入。RIDEV_INPUTSINK = 窗口不在前台也收，
+//       因为我们这个窗口本来就是隐藏的。
+static bool RegisterRawInput(HWND hwnd) {
+    RAWINPUTDEVICE rid = {};
+    rid.usUsagePage = 0x01;   // Generic Desktop Controls
+    rid.usUsage = 0x02;   // Mouse
+    rid.dwFlags = RIDEV_INPUTSINK;
+    rid.hwndTarget = hwnd;
+    return ::RegisterRawInputDevices(&rid, 1, sizeof(rid)) != FALSE;
+}
+
+// v5.0：把一段【设备计数】位移追加进轨迹历史。
+// 位置先累加，再按 kRawThrottleMs 节流地推样本 —— 中间的位移没丢，
+// 只是下一个样本会带上它，摆动分析拿到的仍是完整的位移路径。
+static void RecordRawDelta(LONG dx, LONG dy, ULONGLONG now) {
+    g_rawPosX += (double)dx;
+    g_rawPosY += (double)dy;
+    g_rawLastEventMs = now;
+
+    // 节流：距上个样本不足 kRawThrottleMs 就只更新累加位置，不推入新样本。
+    if (!g_history.empty() &&
+        (now - g_history.back().when) < (ULONGLONG)Config::kRawThrottleMs)
+        return;
+
+    g_history.push_back({ g_rawPosX, g_rawPosY, now });
 
     // 按时间裁剪
     while (!g_history.empty() &&
@@ -314,6 +366,17 @@ static void RecordMove(POINT pt, ULONGLONG now) {
     while (g_history.size() > Config::kHistoryMax) {
         g_history.pop_front();
     }
+}
+
+// v5.0：回退路径。Raw Input 不可用时用光标像素增量填充同一份历史。
+// 注意：这份历史没做鼠标速度归一化，行为等价 v4.9。
+static void RecordFallbackDelta(POINT pt, ULONGLONG now) {
+    if (g_fallbackLastPt.x != INT_MIN) {
+        const LONG dx = pt.x - g_fallbackLastPt.x;
+        const long dy = pt.y - g_fallbackLastPt.y;
+        if (dx || dy) RecordRawDelta(dx, dy, now);
+    }
+    g_fallbackLastPt = pt;
 }
 
 // 一段时间窗内的运动特征
@@ -374,19 +437,21 @@ static Motion WindowStats(double winSec) {
     double xs[Config::kHistoryMax]{};
     double ys[Config::kHistoryMax]{};
     size_t cnt = 0;
-    POINT prev = g_history[i0].pt;
-    xs[cnt] = (double)prev.x;
-    ys[cnt] = (double)prev.y;
+    double prevX = g_history[i0].x;
+    double prevY = g_history[i0].y;
+    xs[cnt] = prevX;
+    ys[cnt] = prevY;
     ++cnt;
 
     for (size_t i = i0 + 1; i < n && cnt < Config::kHistoryMax; ++i) {
-        const long dx = g_history[i].pt.x - prev.x;
-        const long dy = g_history[i].pt.y - prev.y;
-        m.path += std::sqrt((double)dx * (double)dx + (double)dy * (double)dy);
-        xs[cnt] = (double)g_history[i].pt.x;
-        ys[cnt] = (double)g_history[i].pt.y;
+        const double dx = g_history[i].x - prevX;
+        const double dy = g_history[i].y - prevY;
+        m.path += std::sqrt(dx * dx + dy * dy);
+        xs[cnt] = g_history[i].x;
+        ys[cnt] = g_history[i].y;
         ++cnt;
-        prev = g_history[i].pt;
+        prevX = g_history[i].x;
+        prevY = g_history[i].y;
     }
 
     // x / y 两轴分别数摆动次数，取较大者 → 左右晃、上下晃、斜向晃都能识别
@@ -394,10 +459,9 @@ static Motion WindowStats(double winSec) {
     const int revY = CountOscillations(ys, cnt, Config::kShakeMinAmpPx);
     m.reversals = (revX > revY) ? revX : revY;
 
-    const POINT& a = g_history[i0].pt;
-    const POINT& b = g_history[n - 1].pt;
-    m.net = std::sqrt((double)(b.x - a.x) * (double)(b.x - a.x) +
-        (double)(b.y - a.y) * (double)(b.y - a.y));
+    const double ndx = g_history[n - 1].x - g_history[i0].x;
+    const double ndy = g_history[n - 1].y - g_history[i0].y;
+    m.net = std::sqrt(ndx * ndx + ndy * ndy);
 
     m.dt = (double)(now - g_history[i0].when) / 1000.0;
     if (m.dt <= 0.0) return m;
@@ -1209,6 +1273,8 @@ static void OnTrigger(ULONGLONG now) {
 static void Tick() {
     if (g_shutdown) return;
 
+    // v5.0：GetCursorPos 现在只用于两件事 —— 定位光标在哪块屏、作为 Raw Input
+    //       失败时的回退信号。运动学判定本身完全基于 Raw Input。
     POINT pt;
     if (!::GetCursorPos(&pt)) return;
 
@@ -1219,7 +1285,8 @@ static void Tick() {
         g_lastPt = pt;
         monChanged = EnsureRefreshRate(pt);   // 换显示器时重取刷新率（同屏则秒返回）
     }
-    RecordMove(pt, now);
+    if (!g_rawReady && moved)
+        RecordFallbackDelta(pt, now);          // Raw Input 不可用 → 用光标增量兜底
 
     if (!g_enabled) return;
 
@@ -1227,10 +1294,14 @@ static void Tick() {
     if (monChanged && Marquee::Built() && g_enlarged) Marquee::Start(g_mon);
 
     // ---- 静止快速通道 ----
-    // 位置没变 → 速度为 0 → 任何触发条件都不可能成立，整套运动学统计全部跳过。
-    // 空闲时这里只花一次坐标比较，这是"无感运行"的关键。
+    // Raw Input 就绪时：最近 kPollMs 的两个周期内都没原始事件 = 鼠标没动。
+    // Raw Input 不可用时：退化回"光标位置没变"。
+    const bool rawActive = g_rawReady
+        ? (now - g_rawLastEventMs) <= (ULONGLONG)(Config::kPollMs * 2)
+        : moved;
+
     bool moving = false;
-    if (moved) {
+    if (rawActive) {
         const Motion recent = WindowStats(Config::kCalmWindowSec);
         moving = recent.valid && recent.speed >= Config::kCalmSpeed;
     }
@@ -1242,7 +1313,7 @@ static void Tick() {
         //   可见时长从 ~0.5s 提到 ~0.8s，来得及看清；End() 幂等）
         if (Marquee::Busy()) Marquee::End();
 
-        if (!moved) return;             // 没动就不可能触发，直接走
+        if (!rawActive) return;         // 没动就不可能触发，直接走
         // 命中任一【已启用】的通道即放大。默认只启用晃动通道（对齐 macOS）。
         // kEnableSwipe 是留给用户的编译期开关：当前默认 false 时下面的与短路
         // 恒为假 —— 这是有意的配置形态，故局部关闭该静态分析警告。
@@ -1258,7 +1329,7 @@ static void Tick() {
     //   curSpeed >= kSlowSpeed → 仍在"晃 / 快速移动"：续命；若正处于回缩中则立刻反向放大。
     //   curSpeed <  kSlowSpeed → 慢下来了：满足最短保持时间后触发缩小动画。
     double curSpeed = 0.0;
-    if (moved) {
+    if (rawActive) {
         const Motion recent = WindowStats(Config::kCalmWindowSec);
         if (recent.valid) curSpeed = recent.speed;
     }
@@ -1290,6 +1361,11 @@ static void ForceRestore() {
     g_target = Config::kScaleMin;
     g_enlarged = false;
     g_history.clear();
+    // v5.0：复位原始输入累加位置和时间戳，避免下次触发放大时窗口里混进旧样本
+    g_rawPosX = 0.0;
+    g_rawPosY = 0.0;
+    g_rawLastEventMs = 0;
+    g_fallbackLastPt = { INT_MIN, INT_MIN };
     RestoreSystemCursor();
 }
 
@@ -1409,6 +1485,26 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             ShowTrayMenu(pt);
         }
         return 0;
+
+        // v5.0：鼠标原始输入事件。取 RAWMOUSE 的 lLastX / lLastY（设备计数，
+        //       不受系统鼠标速度滑块影响）塞进历史。
+    case WM_INPUT: {
+        if (g_rawReady) {
+            RAWINPUT ri{};
+            UINT size = sizeof(ri);
+            if (::GetRawInputData((HRAWINPUT)lp, RID_INPUT, &ri, &size,
+                sizeof(RAWINPUTHEADER)) == size) {
+                if (ri.header.dwType == RIM_TYPEMOUSE) {
+                    const RAWMOUSE& rm = ri.data.mouse;
+                    if (!(rm.usFlags & MOUSE_MOVE_ABSOLUTE)) {
+                        if (rm.lLastX || rm.lLastY)
+                            RecordRawDelta(rm.lLastX, rm.lLastY, ::GetTickCount64());
+                    }
+                }
+            }
+        }
+        return ::DefWindowProcW(hwnd, msg, wp, lp);
+    }
 
     case WM_DISPLAYCHANGE:        // 分辨率 / 刷新率 / 显示器数量变了
         g_mon = nullptr;
@@ -1606,6 +1702,10 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ PWSTR pCm
     }
     ::ShowWindow(g_hwnd, SW_HIDE);
 
+    // v5.0：注册鼠标原始输入（必须在窗口创建之后）。
+    //       失败时 g_rawReady 保持 false，Tick() 会走 GetCursorPos 回退路径。
+    g_rawReady = RegisterRawInput(g_hwnd);
+
     // 窗口就绪后再拉看门狗（异步，绝不阻塞消息循环）
     SpawnWatchdogAsync();
 
@@ -1620,6 +1720,10 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ PWSTR pCm
     // ⚠️ 必须每次都把消息排空：早先的写法在动画帧分支里 `continue` 跳过了排空，
     //    消息会在队列里积压，之后 MsgWaitForMultipleObjectsEx 便不再为"已经在队列里"
     //    的输入返回 → 整个程序假死（轮询停摆、指针卡在放大状态回不来）。
+    //
+    // ⚠️ WM_INPUT 也走这条消息队列：原始输入事件只有在这一步才被消费，
+    //    所以 Tick() 看到的历史最多滞后一个 Tick 周期（16ms），对 220ms / 750ms
+    //    的判定窗口而言可以忽略。
     const double pollSec = Config::kPollMs / 1000.0;
     const double marqueeSec = Marquee::FrameSec();
     double nextPollAt = QpcNow() + pollSec;
@@ -1676,7 +1780,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ PWSTR pCm
             }
         }
 
-        // 3) 排空消息队列（托盘、会话结束、WM_QUIT 等）
+        // 3) 排空消息队列（托盘、会话结束、WM_QUIT、WM_INPUT 等）
         MSG msg;
         while (::PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
             if (msg.message == WM_QUIT) { done = true; break; }
